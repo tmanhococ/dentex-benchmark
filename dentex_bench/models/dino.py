@@ -222,18 +222,23 @@ class DINORunner(BaseDetectorRunner):
         avg_loss = total_loss / max(1, step)
         return {"loss": avg_loss}
 
-    def predict(self, images: list) -> list:
+    def predict(self, images: Union[torch.Tensor, List[torch.Tensor], tuple]) -> list:
         self.model.eval()
-        if not images:
+        if isinstance(images, torch.Tensor):
+            images_list = [images] if images.ndim == 3 else list(images)
+        else:
+            images_list = list(images)
+
+        if not images_list:
             return []
 
         results = []
         with torch.no_grad():
-            images_tensor = self._prepare_images(images)
+            images_tensor = self._prepare_images(images_list)
             feats = self.proj(self.backbone(images_tensor))
             preds = self.head(feats)
 
-            for i in range(len(images)):
+            for i in range(len(images_list)):
                 logits = preds["pred_logits"][i]
                 probs = torch.softmax(logits, dim=-1)[:, :-1]  # exclude background class
                 scores, labels = probs.max(dim=-1)
@@ -243,7 +248,7 @@ class DINORunner(BaseDetectorRunner):
                 boxes = preds["pred_boxes"][i][keep]
 
                 # Denormalize to individual image coords
-                orig_img = images[i]
+                orig_img = images_list[i]
                 h = orig_img.shape[-2]
                 w = orig_img.shape[-1]
                 scale = torch.tensor([w, h, w, h], device=boxes.device, dtype=torch.float32)

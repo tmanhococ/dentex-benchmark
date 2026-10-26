@@ -198,3 +198,50 @@ def test_evaluate_script_cli(tmp_path):
     assert (tmp_path / "cli_model_out" / "benchmark_summary.md").exists()
 
 
+def test_evaluate_script_dynamic_checkpoint(tmp_path):
+    import subprocess
+    from dentex_bench.config import BenchmarkConfig
+    from dentex_bench.models.dino import DINORunner
+
+    # Create dummy checkpoint
+    cfg = BenchmarkConfig.from_auto_env()
+    runner = DINORunner(cfg)
+    runner.build_model()
+    ckpt_path = tmp_path / "dino_checkpoint.pth"
+    runner.save_checkpoint(ckpt_path, extra_info={"epoch": 1, "loss": 0.5})
+    assert ckpt_path.exists()
+
+    # Create dummy val annotation
+    val_ann_path = tmp_path / "val_ann.json"
+    coco_data = {
+        "images": [{"id": 1, "file_name": "xray1.png", "width": 500, "height": 500}],
+        "categories": [
+            {"id": 1, "name": "Caries"},
+            {"id": 2, "name": "Deep Caries"},
+            {"id": 3, "name": "Periapical Lesion"},
+            {"id": 4, "name": "Impacted Tooth"}
+        ],
+        "annotations": [
+            {"id": 1, "image_id": 1, "category_id": 1, "bbox": [10.0, 10.0, 50.0, 50.0], "area": 2500.0, "iscrowd": 0}
+        ]
+    }
+    val_ann_path.write_text(json.dumps(coco_data), encoding="utf-8")
+
+    out_dir = tmp_path / "dynamic_out"
+    cmd = [
+        sys.executable,
+        "scripts/evaluate.py",
+        "--model", "dino",
+        "--checkpoint", str(ckpt_path),
+        "--val_ann", str(val_ann_path),
+        "--output_dir", str(out_dir)
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, f"Error: {res.stderr}\nOutput: {res.stdout}"
+    assert (out_dir / "benchmark_summary.md").exists()
+    assert (out_dir / "benchmark_table.tex").exists()
+    content = (out_dir / "benchmark_summary.md").read_text(encoding="utf-8")
+    assert "DINO" in content
+
+
+

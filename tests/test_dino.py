@@ -19,13 +19,24 @@ def test_dino_runner_build():
     assert runner.model is model
     assert runner.optimizer is not None
 
-    # Test inference pass with dummy tensor
+    # Test inference pass with dummy tensor (list of 3D, single 3D, and single 4D)
     dummy_imgs = [torch.rand(3, 400, 400)]
     preds = runner.predict(dummy_imgs)
     assert len(preds) == 1
     assert "boxes" in preds[0]
     assert "labels" in preds[0]
     assert "scores" in preds[0]
+
+    # Single 3D tensor input
+    preds_3d = runner.predict(torch.rand(3, 300, 300))
+    assert len(preds_3d) == 1
+    assert "boxes" in preds_3d[0]
+
+    # Single 4D tensor input (batch of 2)
+    preds_4d = runner.predict(torch.rand(2, 3, 300, 300))
+    assert len(preds_4d) == 2
+    assert "boxes" in preds_4d[0]
+    assert "boxes" in preds_4d[1]
 
 
 def test_dino_runner_predict_varying_sizes():
