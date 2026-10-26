@@ -43,6 +43,7 @@ def test_notebooks_content_requirements():
     assert "download_and_prepare" in colab_text
     assert "train" in colab_text
     assert "evaluate" in colab_text
+    assert "git clone" in colab_text
 
     # 02 Kaggle checks
     kaggle_path = nb_dir / "02_kaggle_run_all.ipynb"
@@ -52,12 +53,16 @@ def test_notebooks_content_requirements():
     assert "dentex_bench" in kaggle_text
     assert "train" in kaggle_text
     assert "evaluate" in kaggle_text
+    assert "git clone" in kaggle_text
 
     # 03 Local checks
     local_path = nb_dir / "03_local_benchmark.ipynb"
     assert local_path.exists()
     local_text = local_path.read_text(encoding="utf-8")
     assert "dentex_bench" in local_text
+    assert "project_root.name == 'notebooks'" in local_text or 'project_root.name == "notebooks"' in local_text
+    assert "build_model()" in local_text
+    assert "runner.predict([img_tensor])" in local_text
     assert "visualiz" in local_text.lower() or "matplotlib" in local_text.lower()
     for cat in ["Caries", "Deep Caries", "Periapical Lesion", "Impacted Tooth"]:
         assert cat in local_text

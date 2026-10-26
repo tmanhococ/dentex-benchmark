@@ -13,6 +13,9 @@ from dentex_bench.eval.reporter import save_reports
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate checkpoints and generate benchmark comparison")
+    parser.add_argument("--compare_all", action="store_true", help="Compare all benchmark models")
+    parser.add_argument("--model", type=str, default=None, choices=["faster_rcnn", "dino", "hierarchical_det"], help="Specific model to evaluate")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint")
     parser.add_argument("--val_ann", type=str, default="data/processed/instances_val.json", help="Path to val COCO json")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save markdown and latex reports")
     args = parser.parse_args()
@@ -42,7 +45,20 @@ def main():
             "latency_ms": 65.0, "peak_vram_mb": 2900
         }
     }
-    save_reports(benchmark_results, output_dir)
+
+    if args.model and not args.compare_all:
+        name_map = {
+            "faster_rcnn": "Faster R-CNN",
+            "dino": "DINO",
+            "hierarchical_det": "HierarchicalDet"
+        }
+        selected = name_map[args.model]
+        results_to_save = {selected: benchmark_results[selected]}
+    else:
+        results_to_save = benchmark_results
+
+    save_reports(results_to_save, output_dir)
+    print(f"Reports successfully saved to {output_dir}")
     return 0
 
 

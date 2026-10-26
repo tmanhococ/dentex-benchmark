@@ -175,3 +175,26 @@ def test_evaluate_script_cli(tmp_path):
     assert (tmp_path / "cli_out" / "benchmark_summary.md").exists()
     assert (tmp_path / "cli_out" / "benchmark_table.tex").exists()
 
+    # Test with --compare_all flag
+    cmd_compare = [
+        sys.executable,
+        "scripts/evaluate.py",
+        "--compare_all",
+        "--output_dir", str(tmp_path / "cli_compare_out")
+    ]
+    res_compare = subprocess.run(cmd_compare, capture_output=True, text=True)
+    assert res_compare.returncode == 0
+    assert (tmp_path / "cli_compare_out" / "benchmark_summary.md").exists()
+
+    # Test with --model flag
+    cmd_model = [
+        sys.executable,
+        "scripts/evaluate.py",
+        "--model", "faster_rcnn",
+        "--output_dir", str(tmp_path / "cli_model_out")
+    ]
+    res_model = subprocess.run(cmd_model, capture_output=True, text=True)
+    assert res_model.returncode == 0
+    assert (tmp_path / "cli_model_out" / "benchmark_summary.md").exists()
+
+
