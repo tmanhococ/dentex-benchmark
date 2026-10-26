@@ -98,9 +98,9 @@ def convert_dentex_annotations_to_coco(
             })
             
         for ann in raw_anns:
-            raw_cname = raw_cat_map.get(ann.get("category_id"), "")
-            cat_id = normalize_category_name(raw_cname)
-            if cat_id is None:
+            if ann.get("category_id") in raw_cat_map:
+                cat_id = normalize_category_name(raw_cat_map[ann["category_id"]])
+            else:
                 cat_id = normalize_category_name(ann.get("category", ann.get("category_name", ann.get("category_id"))))
             if cat_id is not None:
                 bbox = ann["bbox"]

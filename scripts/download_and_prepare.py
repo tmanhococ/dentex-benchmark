@@ -1,5 +1,10 @@
+import sys
 import argparse
 from pathlib import Path
+
+# Add project root to path for direct execution
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from dentex_bench.config import BenchmarkConfig
 from dentex_bench.data.downloader import download_dentex_dataset
 from dentex_bench.data.parser import convert_dentex_annotations_to_coco

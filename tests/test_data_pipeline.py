@@ -1,9 +1,14 @@
 # tests/test_data_pipeline.py
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import json
 import pytest
 import numpy as np
 import torch
-from pathlib import Path
 from dentex_bench.data.parser import convert_dentex_annotations_to_coco, TARGET_CLASSES
 from dentex_bench.data.dataset import DentexDataset
 
@@ -60,6 +65,61 @@ def test_parse_dentex_mock(tmp_path):
     assert len(coco_train["categories"]) == 4
     assert len(coco_train["images"]) == 1
     assert len(coco_train["annotations"]) == 2  # excludes Normal
+
+def test_parse_coco_format_with_normal_exclusion(tmp_path):
+    mock_coco = {
+        "images": [
+            {
+                "id": 10,
+                "file_name": "tooth_01.png",
+                "width": 1000,
+                "height": 500
+            }
+        ],
+        "categories": [
+            {"id": 1, "name": "Normal"},
+            {"id": 2, "name": "Caries"}
+        ],
+        "annotations": [
+            {
+                "id": 100,
+                "image_id": 10,
+                "category_id": 1,  # "Normal" in raw_cat_map -> must be excluded!
+                "bbox": [50, 50, 40, 40]
+            },
+            {
+                "id": 101,
+                "image_id": 10,
+                "category_id": 2,  # "Caries" in raw_cat_map -> must be remapped to 1 (Caries in TARGET_CLASSES)
+                "bbox": [150, 150, 60, 60]
+            }
+        ]
+    }
+    raw_path = tmp_path / "mock_coco_raw.json"
+    with open(raw_path, "w") as f:
+        json.dump(mock_coco, f)
+        
+    train_path = tmp_path / "train_coco.json"
+    val_path = tmp_path / "val_coco.json"
+    
+    summary = convert_dentex_annotations_to_coco(
+        raw_ann_file=raw_path,
+        train_out=train_path,
+        val_out=val_path,
+        split_ratio=1.0,
+        seed=42
+    )
+    
+    assert train_path.exists()
+    with open(train_path) as f:
+        train_data = json.load(f)
+        
+    assert len(train_data["images"]) == 1
+    assert len(train_data["annotations"]) == 1
+    ann = train_data["annotations"][0]
+    # Caries must map to TARGET_CLASSES ID 1
+    assert ann["category_id"] == 1
+    assert ann["bbox"] == [150, 150, 60, 60]
 
 def test_dentex_dataset(tmp_path):
     mock_dentex = [

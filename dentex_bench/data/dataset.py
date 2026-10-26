@@ -92,20 +92,22 @@ class DentexDataset(Dataset):
                 except Exception:
                     pass
             
-        # Convert image to float PyTorch tensor [3, H, W] normalized to [0, 1]
+        # Convert image to float PyTorch tensor [3, H, W]
         if isinstance(image, np.ndarray):
+            is_uint8 = (image.dtype == np.uint8)
             if image.ndim == 2:
                 image = np.expand_dims(image, axis=-1)
             if image.shape[-1] == 1:
                 image = np.repeat(image, 3, axis=-1)
             img_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
-            if img_tensor.max() > 1.0:
+            if is_uint8:
                 img_tensor = img_tensor / 255.0
         elif isinstance(image, torch.Tensor):
+            is_uint8 = (image.dtype == torch.uint8)
             img_tensor = image.float()
             if img_tensor.ndim == 3 and img_tensor.shape[0] != 3 and img_tensor.shape[2] == 3:
                 img_tensor = img_tensor.permute(2, 0, 1)
-            if img_tensor.max() > 1.0:
+            if is_uint8:
                 img_tensor = img_tensor / 255.0
         else:
             img_tensor = torch.zeros((3, height, width), dtype=torch.float32)
