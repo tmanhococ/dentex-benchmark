@@ -1,0 +1,40 @@
+import os
+import shutil
+import zipfile
+from pathlib import Path
+
+def download_dentex_dataset(target_dir: Path) -> Path:
+    target_dir = Path(target_dir)
+    raw_dir = target_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if files already exist
+    existing_images = list(raw_dir.glob("**/*.png")) + list(raw_dir.glob("**/*.jpg"))
+    if len(existing_images) > 100:
+        print(f"[dentex_bench] Found {len(existing_images)} existing images in {raw_dir}.")
+        return raw_dir
+
+    print(f"[dentex_bench] Downloading DENTEX dataset from Hugging Face Hub (ibrahimhamamci/DENTEX)...")
+    try:
+        from huggingface_hub import snapshot_download
+        download_path = snapshot_download(
+            repo_id="ibrahimhamamci/DENTEX",
+            repo_type="dataset",
+            local_dir=str(raw_dir),
+            ignore_patterns=["*.git*"]
+        )
+        print(f"[dentex_bench] Download complete to {download_path}")
+    except Exception as e:
+        print(f"[dentex_bench] Warning: Hugging Face snapshot_download failed: {e}")
+        print("[dentex_bench] Please place raw DENTEX files in data/raw/ or provide local archive.")
+        
+    # Unpack any zip files found in raw_dir
+    for zip_file in list(raw_dir.glob("**/*.zip")):
+        print(f"[dentex_bench] Extracting {zip_file.name}...")
+        try:
+            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                zip_ref.extractall(zip_file.parent)
+        except Exception as e:
+            print(f"[dentex_bench] Warning: Failed to extract {zip_file}: {e}")
+            
+    return raw_dir
