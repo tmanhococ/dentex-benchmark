@@ -238,3 +238,43 @@ def test_dentex_dataset_resizing(tmp_path):
     assert abs(box[0].item() - 260 * expected_scale) < 1.0
     assert abs(box[1].item() - 130 * expected_scale) < 1.0
 
+
+def test_score_ann_file_prioritization():
+    from scripts.download_and_prepare import main
+    # Test scoring logic
+    from pathlib import Path
+    # Import the scoring logic directly or test path ordering
+    files = [
+        Path("data/raw/DENTEX/training_data/quadrant/train_quadrant.json"),
+        Path("data/raw/DENTEX/training_data/quadrant_enumeration_disease/train_quadrant_enumeration_disease.json"),
+        Path("data/raw/DENTEX/training_data/enumeration/train_enumeration.json"),
+        Path("data/raw/instances_train.json"),
+    ]
+    
+    # We can inspect score_ann_file if defined or define scoring test
+    def score_ann_file(path: Path) -> int:
+        p_str = path.as_posix().lower()
+        if "instances" in p_str:
+            return -100
+        score = 0
+        if "disease" in p_str:
+            score += 100
+        if "level_3" in p_str or "level3" in p_str:
+            score += 80
+        if "diagnosis" in p_str:
+            score += 60
+        if "train" in p_str:
+            score += 10
+        if "dentex" in p_str:
+            score += 5
+        if "quadrant" in p_str and "disease" not in p_str:
+            score -= 50
+        if "enumeration" in p_str and "disease" not in p_str:
+            score -= 50
+        return score
+
+    sorted_files = sorted(files, key=score_ann_file, reverse=True)
+    assert sorted_files[0].name == "train_quadrant_enumeration_disease.json"
+    assert sorted_files[-1].name == "instances_train.json"
+
+

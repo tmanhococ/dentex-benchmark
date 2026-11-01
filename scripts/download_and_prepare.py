@@ -36,12 +36,32 @@ def main():
         print("[dentex_bench] No JSON annotation file found in data/raw yet. Please check dataset extraction.")
         return
         
-    # Prioritize annotation json files over other config/metadata json
-    candidates = [
-        f for f in json_files 
-        if "instances" not in f.name and ("train" in f.name.lower() or "dentex" in f.name.lower() or "annotation" in f.name.lower())
-    ]
-    ann_file = candidates[0] if candidates else json_files[0]
+    # Prioritize annotation json files for 4-class disease/pathology detection
+    def score_ann_file(path: Path) -> int:
+        p_str = path.as_posix().lower()
+        if "instances" in p_str:
+            return -100
+        score = 0
+        if "disease" in p_str:
+            score += 100
+        if "level_3" in p_str or "level3" in p_str:
+            score += 80
+        if "diagnosis" in p_str:
+            score += 60
+        if "train" in p_str:
+            score += 10
+        if "dentex" in p_str:
+            score += 5
+        # Penalize quadrant-only or enumeration-only files when looking for diseases
+        if "quadrant" in p_str and "disease" not in p_str:
+            score -= 50
+        if "enumeration" in p_str and "disease" not in p_str:
+            score -= 50
+        return score
+
+    json_candidates = [f for f in json_files if "instances" not in f.name]
+    json_candidates.sort(key=score_ann_file, reverse=True)
+    ann_file = json_candidates[0] if json_candidates else json_files[0]
     print(f"[dentex_bench] Using raw annotation file: {ann_file}")
     
     train_out = out_dir / "processed" / "instances_train.json"
