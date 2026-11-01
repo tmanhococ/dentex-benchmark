@@ -10,14 +10,22 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dentex_bench.config import BenchmarkConfig
-from dentex_bench.models import FasterRCNNRunner, DINORunner, HierarchicalDetRunner
+from dentex_bench.models import (
+    FasterRCNNRunner,
+    DINORunner,
+    HierarchicalDetRunner,
+    HierarchicalNetRunner,
+    DiffusionNetRunner
+)
 from scripts.train import collate_fn, parse_args, main
 
 
 def test_runner_factory():
-    """Verify integration of all 3 model runner constructors from BenchmarkConfig."""
+    """Verify integration of all model runner constructors from BenchmarkConfig."""
     cfg = BenchmarkConfig.from_auto_env()
     runner_map = {
+        "hierarchical_net": HierarchicalNetRunner,
+        "diffusion_net": DiffusionNetRunner,
         "faster_rcnn": FasterRCNNRunner,
         "dino": DINORunner,
         "hierarchical_det": HierarchicalDetRunner

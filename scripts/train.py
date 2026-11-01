@@ -1,7 +1,11 @@
 # scripts/train.py
 import argparse
+import json
 import sys
 from pathlib import Path
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 
@@ -10,7 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dentex_bench.config import BenchmarkConfig
 from dentex_bench.data.dataset import DentexDataset
-from dentex_bench.models import FasterRCNNRunner, DINORunner, HierarchicalDetRunner
+from dentex_bench.models import (
+    FasterRCNNRunner,
+    DINORunner,
+    HierarchicalDetRunner,
+    HierarchicalNetRunner,
+    DiffusionNetRunner
+)
 
 
 def collate_fn(batch):
@@ -24,7 +34,7 @@ def parse_args(args=None):
         "--model",
         type=str,
         required=True,
-        choices=["faster_rcnn", "dino", "hierarchical_det"],
+        choices=["hierarchical_net", "diffusion_net", "faster_rcnn", "dino", "hierarchical_det"],
         help="Detector model runner to train"
     )
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
@@ -33,6 +43,21 @@ def parse_args(args=None):
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing raw/ and processed/")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory where checkpoints are saved")
     return parser.parse_args(args)
+
+
+def plot_training_history(history: list, output_file: Path):
+    epochs = [h["epoch"] for h in history]
+    losses = [h["loss"] for h in history]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(epochs, losses, marker="o", color="#2b5c8f", label="Training Loss")
+    ax.set_title("Training Loss Curve")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=160)
+    plt.close(fig)
 
 
 def main(args=None):
@@ -52,6 +77,8 @@ def main(args=None):
 
     # Initialize runner
     runners = {
+        "hierarchical_net": HierarchicalNetRunner,
+        "diffusion_net": DiffusionNetRunner,
         "faster_rcnn": FasterRCNNRunner,
         "dino": DINORunner,
         "hierarchical_det": HierarchicalDetRunner
@@ -80,16 +107,24 @@ def main(args=None):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_loss = float("inf")
+    history = []
     for epoch in range(1, cfg.epochs + 1):
         loss_dict = runner.train_epoch(dataloader, epoch)
         current_loss = loss_dict["loss"]
+        history.append({"epoch": epoch, "loss": current_loss})
         print(f"Epoch [{epoch}/{cfg.epochs}] - Loss: {current_loss:.4f}")
 
-        # Save checkpoints
+        # Always update last.pth at current epoch
         runner.save_checkpoint(output_dir / "last.pth", extra_info={"epoch": epoch, "loss": current_loss})
+        # Save best.pth when loss improves
         if current_loss < best_loss:
             best_loss = current_loss
             runner.save_checkpoint(output_dir / "best.pth", extra_info={"epoch": epoch, "loss": current_loss})
+
+    # Save history json and curve plot
+    with open(output_dir / "history.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    plot_training_history(history, output_dir / "training_curves.png")
 
     print(f"=== Training Finished for {args.model}. Checkpoints saved to {output_dir} ===")
     return 0
