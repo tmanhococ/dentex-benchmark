@@ -149,7 +149,7 @@ def test_dentex_dataset(tmp_path):
         seed=42
     )
     
-    ds = DentexDataset(img_dir=tmp_path, ann_file=train_path)
+    ds = DentexDataset(img_dir=tmp_path, ann_file=train_path, resize=False)
     assert len(ds) == 1
     img_tensor, target = ds[0]
     assert isinstance(img_tensor, torch.Tensor)
@@ -157,3 +157,46 @@ def test_dentex_dataset(tmp_path):
     assert target["boxes"].shape == (2, 4)
     assert list(target["labels"].numpy()) == [1, 2]
     assert target["image_id"].item() == 1
+
+def test_dentex_dataset_resizing(tmp_path):
+    mock_dentex = [
+        {
+            "image_id": 1,
+            "file_name": "large_01.png",
+            "width": 2600,
+            "height": 1300,
+            "annotations": [
+                {"bbox": [260, 130, 260, 260], "category": "Caries"}
+            ]
+        }
+    ]
+    raw_path = tmp_path / "mock_raw.json"
+    with open(raw_path, "w") as f:
+        json.dump(mock_dentex, f)
+        
+    train_path = tmp_path / "train.json"
+    val_path = tmp_path / "val.json"
+    
+    convert_dentex_annotations_to_coco(
+        raw_ann_file=raw_path,
+        train_out=train_path,
+        val_out=val_path,
+        split_ratio=1.0,
+        seed=42
+    )
+    
+    # Default dataset should resize large image to safe dimensions
+    ds = DentexDataset(img_dir=tmp_path, ann_file=train_path, target_short=800, max_long=1333)
+    img_tensor, target = ds[0]
+    h, w = img_tensor.shape[1], img_tensor.shape[2]
+    assert max(h, w) <= 1333
+    assert min(h, w) <= 800
+    # Original aspect ratio 2:1 -> scaled down by scale factor
+    expected_scale = min(800.0 / 1300.0, 1333.0 / 2600.0)
+    assert abs(w - round(2600 * expected_scale)) <= 1
+    assert abs(h - round(1300 * expected_scale)) <= 1
+    # Check boxes scaled proportionally
+    box = target["boxes"][0]
+    assert abs(box[0].item() - 260 * expected_scale) < 1.0
+    assert abs(box[1].item() - 130 * expected_scale) < 1.0
+

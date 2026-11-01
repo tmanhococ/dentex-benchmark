@@ -21,13 +21,14 @@ class BenchmarkConfig:
     
     # Training hyperparameters
     batch_size: int = 1
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 16
     amp: bool = True
     img_size: int = 800
     num_workers: int = 0
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
     epochs: int = 30
+    models: List[str] = field(default_factory=lambda: ["hierarchical_net", "diffusion_net"])
     
     # Paths
     root_dir: Path = field(default_factory=lambda: Path("."))
@@ -40,17 +41,11 @@ class BenchmarkConfig:
         dev_info = get_device_info()
         is_low = dev_info["is_low_vram"]
         
-        # Adaptive tuning
-        if is_low:
-            batch_size = 1
-            grad_accum = 4
-            img_size = 800
-            num_workers = 0 if os.name == "nt" else 2
-        else:
-            batch_size = 4
-            grad_accum = 1
-            img_size = 1024
-            num_workers = 4
+        # Adaptive tuning: batch_size=1 with gradient accumulation 16 is universally memory-safe
+        batch_size = 1
+        grad_accum = 16
+        img_size = 800
+        num_workers = 0 if os.name == "nt" else 2
             
         base = Path(root_dir)
         output_dir = Path("/kaggle/working/outputs") if platform == "kaggle" else base / "outputs"

@@ -16,7 +16,10 @@ class DentexDataset(Dataset):
         self,
         img_dir: Union[str, Path],
         ann_file: Union[str, Path],
-        transforms: Optional[Callable] = None
+        transforms: Optional[Callable] = None,
+        target_short: Optional[int] = 800,
+        max_long: Optional[int] = 1333,
+        resize: bool = True
     ):
         self.img_dir = Path(img_dir)
         ann_file = Path(ann_file)
@@ -25,6 +28,9 @@ class DentexDataset(Dataset):
             
         self.images = self.coco.get("images", [])
         self.transforms = transforms
+        self.target_short = target_short
+        self.max_long = max_long
+        self.resize = resize
         
         # Index annotations by image_id
         self.img_to_anns: Dict[int, list] = {}
@@ -67,6 +73,17 @@ class DentexDataset(Dataset):
             w = width if width > 0 else 1000
             image = np.zeros((h, w, 3), dtype=np.uint8)
             
+        scale = 1.0
+        if self.resize and self.target_short is not None and image is not None:
+            cur_h, cur_w = image.shape[:2]
+            max_l = self.max_long if self.max_long is not None else 1333
+            scale = min(float(self.target_short) / max(1, min(cur_h, cur_w)),
+                        float(max_l) / max(1, max(cur_h, cur_w)))
+            if abs(scale - 1.0) > 1e-4:
+                new_w = max(1, int(round(cur_w * scale)))
+                new_h = max(1, int(round(cur_h * scale)))
+                image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
         anns = self.img_to_anns.get(img_id, [])
         boxes = []
         labels = []
@@ -74,9 +91,9 @@ class DentexDataset(Dataset):
         
         for ann in anns:
             x, y, w, h = ann["bbox"]
-            boxes.append([float(x), float(y), float(x + w), float(y + h)])  # xyxy format
+            boxes.append([float(x * scale), float(y * scale), float((x + w) * scale), float((y + h) * scale)])  # xyxy format
             labels.append(int(ann["category_id"]))
-            areas.append(float(ann.get("area", w * h)))
+            areas.append(float(ann.get("area", w * h) * (scale ** 2)))
             
         if self.transforms is not None:
             try:
