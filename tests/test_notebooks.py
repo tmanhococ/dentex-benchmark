@@ -103,6 +103,22 @@ def test_dentex_eda_analysis_notebook():
         assert key in text, f"Missing {key} in dentex_eda_analysis.ipynb"
 
 
+def test_dentex_inference_error_analysis_notebook():
+    nb_path = Path("notebooks/dentex_inference_error_analysis.ipynb")
+    assert nb_path.exists()
+    text = nb_path.read_text(encoding="utf-8")
+    for key in [
+        "HierarchicalNet",
+        "DiffusionNet",
+        "Confusion Matrix",
+        "Success Profiling",
+        "Top 5 Failure Modes",
+        "Ground Truth",
+        "best.pth",
+    ]:
+        assert key in text, f"Missing {key} in dentex_inference_error_analysis.ipynb"
+
+
 def test_notebook_code_cells_syntax():
     nb_dir = Path("notebooks")
     for nb in nb_dir.glob("*.ipynb"):
