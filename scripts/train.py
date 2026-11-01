@@ -87,12 +87,24 @@ def main(args=None):
     runner.build_model()
 
     train_ann = Path(args.data_dir) / "processed" / "instances_train.json"
-    img_dir = Path(args.data_dir) / "raw"
+    if not train_ann.exists():
+        fallback_ann = Path("data/processed/instances_train.json")
+        if fallback_ann.exists():
+            train_ann = fallback_ann
 
     if not train_ann.exists():
         print(f"[dentex_bench] Error: Training annotations not found at {train_ann}.")
         print("Please run `python scripts/download_and_prepare.py` first.")
         return 1
+
+    img_dir = Path(args.data_dir) / "raw"
+    if not img_dir.exists() or not any(img_dir.glob("*.*")):
+        if Path(args.data_dir).exists() and any(Path(args.data_dir).glob("**/*.png")):
+            img_dir = Path(args.data_dir)
+        elif Path("data/raw").exists():
+            img_dir = Path("data/raw")
+        elif Path("data").exists():
+            img_dir = Path("data")
 
     dataset = DentexDataset(img_dir=img_dir, ann_file=train_ann)
     dataloader = DataLoader(
