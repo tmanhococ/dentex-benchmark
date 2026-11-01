@@ -40,8 +40,16 @@ def main():
     def score_ann_file(path: Path) -> int:
         p_str = path.as_posix().lower()
         if "instances" in p_str:
-            return -100
+            return -200
         score = 0
+        # Heavily penalize test or sample files (e.g. test_163.json)
+        if "test" in p_str:
+            score -= 150
+        if path.is_file() and path.stat().st_size < 10000:
+            score -= 100
+        if "val" in p_str and "disease" not in p_str:
+            score -= 50
+            
         if "disease" in p_str:
             score += 100
         if "level_3" in p_str or "level3" in p_str:
@@ -49,7 +57,7 @@ def main():
         if "diagnosis" in p_str:
             score += 60
         if "train" in p_str:
-            score += 10
+            score += 40
         if "dentex" in p_str:
             score += 5
         # Penalize quadrant-only or enumeration-only files when looking for diseases
@@ -74,6 +82,14 @@ def main():
         split_ratio=cfg.train_val_split_ratio,
         seed=args.seed
     )
+    
+    if stats["train_images"] == 0 or stats["train_annotations"] == 0:
+        raise RuntimeError(
+            f"[dentex_bench] Lỗi nghiêm trọng: Tạo ra {stats['train_images']} ảnh và "
+            f"{stats['train_annotations']} nhãn từ '{ann_file}'. "
+            "Vui lòng đảm bảo dataset DENTEX training đã được giải nén đầy đủ."
+        )
+        
     print(f"[dentex_bench] COCO format dataset prepared:")
     print(f"  Train: {stats['train_images']} images, {stats['train_annotations']} annotations -> {train_out}")
     print(f"  Val:   {stats['val_images']} images, {stats['val_annotations']} annotations -> {val_out}")

@@ -4,10 +4,10 @@ import subprocess
 import importlib
 
 def detect_platform() -> str:
-    if "google.colab" in sys.modules or os.path.exists("/content"):
-        return "colab"
     if "KAGGLE_KERNEL_RUN_TYPE" in os.environ or os.path.exists("/kaggle/working"):
         return "kaggle"
+    if "google.colab" in sys.modules or os.path.exists("/content"):
+        return "colab"
     return "local"
 
 def get_device_info() -> dict:
