@@ -10,6 +10,8 @@ def test_notebooks_exist_and_valid():
         "01_colab_run_all.ipynb",
         "02_kaggle_run_all.ipynb",
         "03_local_benchmark.ipynb",
+        "dentex_eda_analysis.ipynb",
+        "dentex_inference_error_analysis.ipynb",
     ]
 
     for name in expected_notebooks:
