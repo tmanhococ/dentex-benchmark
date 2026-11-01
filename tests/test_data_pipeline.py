@@ -158,6 +158,44 @@ def test_dentex_dataset(tmp_path):
     assert list(target["labels"].numpy()) == [1, 2]
     assert target["image_id"].item() == 1
 
+def test_parse_dentex_level3_format(tmp_path):
+    mock_level3 = {
+        "images": [
+            {"id": 1, "file_name": "xrays/train_01.png", "width": 1000, "height": 500},
+            {"id": 2, "file_name": "xrays/train_02.png", "width": 1000, "height": 500}
+        ],
+        "categories_1": {"0": {"id": 0, "name": "Quadrant 1"}},
+        "categories_2": {"0": {"id": 0, "name": "Central Incisor"}},
+        "categories_3": {
+            "0": {"id": 0, "name": "Impacted"},
+            "1": {"id": 1, "name": "Caries"},
+            "2": {"id": 2, "name": "Periapical Lesions"},
+            "3": {"id": 3, "name": "Deep Caries"}
+        },
+        "annotations": [
+            {"id": 1, "image_id": 1, "category_id_1": 0, "category_id_2": 0, "category_id_3": 1, "bbox": [10, 10, 20, 20]},
+            {"id": 2, "image_id": 1, "category_id_1": 0, "category_id_2": 0, "category_id_3": 3, "bbox": [50, 50, 30, 30]},
+            {"id": 3, "image_id": 2, "category_id_1": 0, "category_id_2": 0, "category_id_3": 0, "bbox": [100, 100, 40, 40]},
+            {"id": 4, "image_id": 2, "category_id_1": 0, "category_id_2": 0, "category_id_3": 2, "bbox": [150, 150, 50, 50]}
+        ]
+    }
+    raw_path = tmp_path / "mock_level3.json"
+    with open(raw_path, "w") as f:
+        json.dump(mock_level3, f)
+        
+    train_path = tmp_path / "train_l3.json"
+    val_path = tmp_path / "val_l3.json"
+    
+    stats = convert_dentex_annotations_to_coco(
+        raw_ann_file=raw_path,
+        train_out=train_path,
+        val_out=val_path,
+        split_ratio=0.5,
+        seed=42
+    )
+    assert stats["train_annotations"] == 2
+    assert stats["val_annotations"] == 2
+
 def test_dentex_dataset_resizing(tmp_path):
     mock_dentex = [
         {

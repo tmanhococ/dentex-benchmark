@@ -83,10 +83,20 @@ def convert_dentex_annotations_to_coco(
                 "height": height
             })
     else:
-        # Format 2: Standard COCO structure with raw labels
+        # Format 2: Standard COCO structure with raw labels or DENTEX Level 3
         raw_items = data.get("images", [])
         raw_anns = data.get("annotations", [])
-        raw_cat_map = {c["id"]: c.get("name", "") for c in data.get("categories", [])}
+        
+        raw_cats = data.get("categories", [])
+        if not raw_cats and "categories_3" in data:
+            c3 = data["categories_3"]
+            raw_cats = list(c3.values()) if isinstance(c3, dict) else c3
+            
+        raw_cat_map = {}
+        for c in raw_cats:
+            if isinstance(c, dict) and "id" in c:
+                raw_cat_map[c["id"]] = c.get("name", "")
+                raw_cat_map[str(c["id"])] = c.get("name", "")
         
         for img in raw_items:
             iid = img.get("id", img.get("image_id"))
@@ -98,10 +108,17 @@ def convert_dentex_annotations_to_coco(
             })
             
         for ann in raw_anns:
-            if ann.get("category_id") in raw_cat_map:
-                cat_id = normalize_category_name(raw_cat_map[ann["category_id"]])
+            cid_val = None
+            for key in ["category_id_3", "category_id", "category", "category_name"]:
+                if key in ann and ann[key] is not None:
+                    cid_val = ann[key]
+                    break
+
+            if cid_val in raw_cat_map:
+                cat_id = normalize_category_name(raw_cat_map[cid_val])
             else:
-                cat_id = normalize_category_name(ann.get("category", ann.get("category_name", ann.get("category_id"))))
+                cat_id = normalize_category_name(cid_val)
+
             if cat_id is not None:
                 bbox = ann["bbox"]
                 area = float(ann.get("area", bbox[2] * bbox[3]))
