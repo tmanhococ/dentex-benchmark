@@ -1,7 +1,11 @@
 # tests/test_analysis_fixtures.py
 import json
+import sys
 from pathlib import Path
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from scripts.create_test_fixtures import create_sample_fixtures
 
 def test_create_sample_fixtures(tmp_path):

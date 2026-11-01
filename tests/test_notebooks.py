@@ -85,6 +85,24 @@ def test_documentation_and_requirements():
         assert model in readme_text
 
 
+def test_dentex_eda_analysis_notebook():
+    nb_path = Path("notebooks/dentex_eda_analysis.ipynb")
+    assert nb_path.exists()
+    text = nb_path.read_text(encoding="utf-8")
+    for key in [
+        "instances_train.json",
+        "instances_val.json",
+        "Spatial Heatmap",
+        "Co-occurrence",
+        "COCO",
+        "Caries",
+        "Deep Caries",
+        "Periapical Lesion",
+        "Impacted Tooth",
+    ]:
+        assert key in text, f"Missing {key} in dentex_eda_analysis.ipynb"
+
+
 def test_notebook_code_cells_syntax():
     nb_dir = Path("notebooks")
     for nb in nb_dir.glob("*.ipynb"):
