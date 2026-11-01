@@ -26,11 +26,16 @@ The benchmark standardizes detection across the **4 clinical dental abnormality 
 
 ## 2. Evaluated Model Architectures
 
-Three representative object detection paradigms are evaluated under identical train/validation splits, data augmentations, and evaluation protocols:
+The benchmark centers on two advanced detection paradigms for 4-class dental abnormality detection, evaluated alongside classical baselines under identical train/validation splits, multi-scale augmentations, and evaluation protocols:
 
-1. **Faster R-CNN (`faster_rcnn`)**: Two-stage anchor-based CNN baseline with ResNet50-FPN backbone and Fast R-CNN box regression head.
-2. **DINO (`dino`)**: Modern Vision Transformer (DETR-based) detector with contrastive DeNoising anchor boxes and bipartite Hungarian matching.
-3. **HierarchicalDet (`hierarchical_det`)**: Diffusion-based object detection framework (official DENTEX baseline adapted for 4 abnormality classes) with iterative reverse-diffusion box generation and ResNet50-FPN feature backbone.
+### Primary Benchmark Architectures
+1. **HierarchicalNet (`hierarchical_net`)**: Multi-scale feature hierarchy with ResNet-50 backbone and Feature Pyramid Network (FPN, $P_2 \rightarrow P_5$). Designed to effectively detect pathologies with extreme spatial scale differences (from tiny enamel caries to large impacted third molars).
+2. **DiffusionNet (`diffusion_net`)**: Denoising diffusion probabilistic model (DiffusionDet paradigm) with `DynamicDiffusionHead`. Utilizes sinusoidal timestep embeddings and iterative progressive box denoising for pathology localization and classification.
+
+### Classical Detection Baselines
+3. **Faster R-CNN (`faster_rcnn`)**: Two-stage anchor-based CNN baseline with ResNet50-FPN backbone and Fast R-CNN box regression head.
+4. **DINO (`dino`)**: Modern Vision Transformer (DETR-based) detector with contrastive DeNoising anchor boxes and bipartite Hungarian matching.
+5. **HierarchicalDet (`hierarchical_det`)**: Diffusion-based object detection framework (official DENTEX baseline adapted for 4 abnormality classes) with iterative reverse-diffusion box generation and ResNet50-FPN feature backbone.
 
 ---
 
@@ -74,14 +79,15 @@ python scripts/download_and_prepare.py --seed 42
 Train each model using the unified CLI runner:
 
 ```bash
-# Train Faster R-CNN
+# Train HierarchicalNet (30 epochs, memory-safe)
+python scripts/train.py --model hierarchical_net --epochs 30 --lr 0.0001
+
+# Train DiffusionNet (30 epochs, memory-safe)
+python scripts/train.py --model diffusion_net --epochs 30 --lr 0.0001
+
+# Classical Baselines (Optional)
 python scripts/train.py --model faster_rcnn --epochs 30 --lr 0.005
-
-# Train DINO
 python scripts/train.py --model dino --epochs 30 --lr 0.0001
-
-# Train HierarchicalDet
-python scripts/train.py --model hierarchical_det --epochs 30 --lr 0.0001
 ```
 
 ### Step 3: Comprehensive Evaluation & Benchmarking
