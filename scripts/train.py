@@ -89,7 +89,10 @@ def main(args=None):
     train_ann = Path(args.data_dir) / "processed" / "instances_train.json"
     if not train_ann.exists():
         fallback_ann = Path("data/processed/instances_train.json")
-        if fallback_ann.exists():
+        if fallback_ann.exists() and (
+            args.data_dir == "data" or
+            (Path(args.data_dir).exists() and any(Path(args.data_dir).glob("**/*.png")))
+        ):
             train_ann = fallback_ann
 
     if not train_ann.exists():
