@@ -66,9 +66,9 @@ def review_package(plan_path: str, base_commit: str, head_commit: str, out_file:
         head_short = subprocess.check_output(["git", "rev-parse", "--short", head_commit], text=True).strip()
         out_path = ws / f"review-{base_short}..{head_short}.diff"
         
-    log_out = subprocess.check_output(["git", "log", "--oneline", f"{base_commit}..{head_commit}"], text=True)
-    stat_out = subprocess.check_output(["git", "diff", "--stat", f"{base_commit}..{head_commit}"], text=True)
-    diff_out = subprocess.check_output(["git", "diff", "-U10", f"{base_commit}..{head_commit}"], text=True)
+    log_out = subprocess.check_output(["git", "log", "--oneline", f"{base_commit}..{head_commit}"], encoding="utf-8", errors="replace")
+    stat_out = subprocess.check_output(["git", "diff", "--stat", f"{base_commit}..{head_commit}"], encoding="utf-8", errors="replace")
+    diff_out = subprocess.check_output(["git", "diff", "-U10", f"{base_commit}..{head_commit}"], encoding="utf-8", errors="replace")
     
     content = f"# Review package: {base_commit}..{head_commit}\n\n## Commits\n{log_out}\n## Files changed\n{stat_out}\n## Diff\n{diff_out}\n"
     out_path.write_text(content, encoding="utf-8")
