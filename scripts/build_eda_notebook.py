@@ -1,4 +1,11 @@
-"""Script to generate notebooks/dentex_eda_analysis.ipynb."""
+"""Programmatic generator for notebooks/dentex_eda_analysis.ipynb.
+
+This script constructs the publication-grade DENTEX EDA Jupyter notebook JSON
+with pre-formatted markdown notes, LaTeX formulas, and syntactically validated
+Python code cells. Run this script via:
+    python scripts/build_eda_notebook.py
+to re-generate notebooks/dentex_eda_analysis.ipynb if template cells are modified.
+"""
 import json
 from pathlib import Path
 
@@ -17,6 +24,8 @@ def build_notebook():
             "2. **Deep Caries** (`#D55E00` - Vermilion)\n",
             "3. **Periapical Lesion** (`#0072B2` - Blue)\n",
             "4. **Impacted Tooth** (`#009E73` - Green)\n",
+            "\n",
+            "> **Note on Maintenance & Generation**: This notebook is self-contained and can be executed directly in Jupyter, VS Code, or Google Colab. It can also be programmatically regenerated or synchronized via `python scripts/build_eda_notebook.py`.\n",
             "\n",
             "---\n",
             "### Notebook Outline:\n",
