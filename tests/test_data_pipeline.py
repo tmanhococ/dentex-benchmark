@@ -278,3 +278,44 @@ def test_score_ann_file_prioritization():
     assert sorted_files[-1].name == "instances_train.json"
 
 
+def test_selective_extract_dentex_zip(tmp_path):
+    import zipfile
+    from dentex_bench.data.downloader import selective_extract_dentex_zip
+    
+    zip_path = tmp_path / "mock_training_data.zip"
+    extract_target = tmp_path / "extracted"
+    extract_target.mkdir()
+    
+    # Create a mock zip with quadrant files (should be skipped) and disease files (should be kept)
+    disease_json = {
+        "images": [
+            {"id": 1, "file_name": "dis_01.png", "width": 100, "height": 100},
+            {"id": 2, "file_name": "dis_02.png", "width": 100, "height": 100}
+        ],
+        "annotations": [],
+        "categories_3": [{"id": 1, "name": "Caries"}]
+    }
+    quad_json = {
+        "images": [{"id": 101, "file_name": "quad_01.png", "width": 100, "height": 100}],
+        "annotations": []
+    }
+    
+    with zipfile.ZipFile(zip_path, "w") as z:
+        z.writestr("training_data/quadrant/train_quadrant.json", json.dumps(quad_json))
+        z.writestr("training_data/quadrant/xrays/quad_01.png", b"fake quadrant image data")
+        z.writestr("training_data/quadrant_enumeration_disease/train_quadrant_enumeration_disease.json", json.dumps(disease_json))
+        z.writestr("training_data/quadrant_enumeration_disease/xrays/dis_01.png", b"fake disease image 1")
+        z.writestr("training_data/quadrant_enumeration_disease/xrays/dis_02.png", b"fake disease image 2")
+        
+    selective_extract_dentex_zip(zip_path, extract_target)
+    
+    # Verify disease files exist
+    assert (extract_target / "training_data/quadrant_enumeration_disease/train_quadrant_enumeration_disease.json").exists()
+    assert (extract_target / "training_data/quadrant_enumeration_disease/xrays/dis_01.png").exists()
+    assert (extract_target / "training_data/quadrant_enumeration_disease/xrays/dis_02.png").exists()
+    
+    # Verify quadrant image was skipped (saving massive disk space)
+    assert not (extract_target / "training_data/quadrant/xrays/quad_01.png").exists()
+
+
+
