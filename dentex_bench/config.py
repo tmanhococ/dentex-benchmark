@@ -23,7 +23,8 @@ class BenchmarkConfig:
     batch_size: int = 1
     gradient_accumulation_steps: int = 16
     amp: bool = True
-    img_size: int = 800
+    img_size: int = 800   # shorter side after resizing
+    max_size: int = 1333  # cap on the longer side after resizing
     num_workers: int = 0
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4

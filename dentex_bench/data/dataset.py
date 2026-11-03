@@ -7,6 +7,92 @@ from pathlib import Path
 from typing import Optional, Callable, Dict, Any, Tuple, Union
 from torch.utils.data import Dataset
 
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+
+def build_image_index(root: Union[str, Path]) -> Dict[str, list]:
+    """Maps lower-cased file names to every matching image path below root."""
+    index: Dict[str, list] = {}
+    for p in sorted(Path(root).rglob("*")):
+        if p.suffix.lower() in IMAGE_SUFFIXES and p.is_file():
+            index.setdefault(p.name.lower(), []).append(p)
+    return index
+
+
+def _candidate_rank(path: Path) -> tuple:
+    # DENTEX subsets reuse names (train_0.png ...); the disease subset owns the 4-class labels
+    s = path.as_posix().lower()
+    return (0 if "disease" in s else 1, s)
+
+
+def read_rgb(path: Union[str, Path]) -> Optional[np.ndarray]:
+    loaded = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if loaded is None:
+        return None
+    if loaded.ndim == 2:
+        return cv2.cvtColor(loaded, cv2.COLOR_GRAY2RGB)
+    if loaded.shape[2] == 4:
+        return cv2.cvtColor(loaded, cv2.COLOR_BGRA2RGB)
+    return cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB)
+
+
+def resolve_image_path(
+    file_name: str,
+    width: Optional[int],
+    height: Optional[int],
+    img_dir: Union[str, Path],
+    index: Optional[Dict[str, list]] = None
+) -> Path:
+    """
+    Finds the radiograph an annotation refers to (reading only image headers).
+
+    Raises FileNotFoundError when no file has that name, and ValueError when files with that name
+    exist but none has the annotated width x height (i.e. it would be a different radiograph).
+    """
+    from PIL import Image
+
+    img_dir = Path(img_dir)
+    direct = img_dir / file_name
+    if direct.is_file():
+        candidates = [direct]
+    else:
+        if index is None:
+            index = build_image_index(img_dir)
+        candidates = sorted(index.get(Path(file_name).name.lower(), []), key=_candidate_rank)
+    if not candidates:
+        raise FileNotFoundError(f"Image '{file_name}' not found under {img_dir}")
+
+    rejected = []
+    for path in candidates:
+        try:
+            with Image.open(path) as im:
+                w, h = im.size
+        except OSError:
+            rejected.append(f"{path} (unreadable)")
+            continue
+        if not width or not height or (w == int(width) and h == int(height)):
+            return path
+        rejected.append(f"{path} ({w}x{h})")
+    raise ValueError(
+        f"No file named '{file_name}' matches the annotated size {width}x{height}: {rejected}"
+    )
+
+
+def load_annotated_image(
+    file_name: str,
+    width: Optional[int],
+    height: Optional[int],
+    img_dir: Union[str, Path],
+    index: Optional[Dict[str, list]] = None
+) -> Tuple[np.ndarray, Path]:
+    """Loads the radiograph an annotation refers to as RGB uint8 (see resolve_image_path for errors)."""
+    path = resolve_image_path(file_name, width, height, img_dir, index)
+    image = read_rgb(path)
+    if image is None:
+        raise ValueError(f"Image '{path}' could not be decoded")
+    return image, path
+
+
 class DentexDataset(Dataset):
     """
     PyTorch Dataset for DENTEX 4-Class Abnormal Tooth Detection.
@@ -36,43 +122,32 @@ class DentexDataset(Dataset):
         self.img_to_anns: Dict[int, list] = {}
         for ann in self.coco.get("annotations", []):
             self.img_to_anns.setdefault(ann["image_id"], []).append(ann)
-            
+        self._image_index: Optional[Dict[str, list]] = None
+
     def __len__(self) -> int:
         return len(self.images)
-        
+
+    def image_path(self, idx: int) -> Path:
+        info = self.images[idx]
+        return load_annotated_image(info["file_name"], info.get("width"), info.get("height"), self.img_dir, self._index())[1]
+
+    def _index(self) -> Dict[str, list]:
+        if self._image_index is None:
+            self._image_index = build_image_index(self.img_dir)
+        return self._image_index
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         img_info = self.images[idx]
         img_id = img_info["id"]
         file_name = img_info.get("file_name", f"{img_id}.png")
-        
-        img_path = self.img_dir / file_name
-        if not img_path.exists():
-            # Try searching recursively in subdirectories if nested
-            matches = list(self.img_dir.glob(f"**/{file_name}"))
-            img_path = matches[0] if matches else img_path
-            
-        height = int(img_info.get("height", 500) or 500)
-        width = int(img_info.get("width", 1000) or 1000)
-        
-        image = None
-        if img_path.exists() and img_path.is_file():
-            loaded = cv2.imread(str(img_path))
-            if loaded is not None:
-                if loaded.ndim == 2:
-                    image = cv2.cvtColor(loaded, cv2.COLOR_GRAY2RGB)
-                elif loaded.shape[2] == 3:
-                    image = cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB)
-                elif loaded.shape[2] == 4:
-                    image = cv2.cvtColor(loaded, cv2.COLOR_BGRA2RGB)
-                else:
-                    image = loaded
-                    
-        if image is None:
-            # Synthetic fallback for missing images or unit testing
-            h = height if height > 0 else 500
-            w = width if width > 0 else 1000
-            image = np.zeros((h, w, 3), dtype=np.uint8)
-            
+        height = img_info.get("height")
+        width = img_info.get("width")
+
+        if (self.img_dir / file_name).is_file():
+            image, _ = load_annotated_image(file_name, width, height, self.img_dir)
+        else:
+            image, _ = load_annotated_image(file_name, width, height, self.img_dir, self._index())
+
         scale = 1.0
         if self.resize and self.target_short is not None and image is not None:
             cur_h, cur_w = image.shape[:2]
@@ -127,7 +202,7 @@ class DentexDataset(Dataset):
             if is_uint8:
                 img_tensor = img_tensor / 255.0
         else:
-            img_tensor = torch.zeros((3, height, width), dtype=torch.float32)
+            raise TypeError(f"Unsupported image type after transforms: {type(image)}")
 
         target = {
             "boxes": torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),

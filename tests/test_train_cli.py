@@ -109,6 +109,11 @@ def test_train_cli_synthetic_epoch(tmp_path):
     }
     with open(processed_dir / "instances_train.json", "w") as f:
         json.dump(ann_data, f)
+    with open(processed_dir / "instances_val.json", "w") as f:
+        json.dump(ann_data, f)
+    import cv2
+    import numpy as np
+    cv2.imwrite(str(raw_dir / "sample.png"), np.zeros((64, 64, 3), np.uint8))
 
     output_dir = tmp_path / "outputs"
     ret = main([
@@ -129,3 +134,5 @@ def test_train_cli_synthetic_epoch(tmp_path):
     assert "extra_info" in ckpt
     assert ckpt["extra_info"]["epoch"] == 1
     assert "loss" in ckpt["extra_info"]
+    # best.pth is chosen on the validation split, so the val metric must be recorded
+    assert "val_mAP50" in ckpt["extra_info"]

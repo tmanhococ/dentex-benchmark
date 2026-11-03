@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import json
 import pytest
+import cv2
 import numpy as np
 import torch
 from dentex_bench.data.parser import convert_dentex_annotations_to_coco, TARGET_CLASSES
@@ -149,6 +150,7 @@ def test_dentex_dataset(tmp_path):
         seed=42
     )
     
+    cv2.imwrite(str(tmp_path / "test_01.png"), np.zeros((50, 100, 3), np.uint8))
     ds = DentexDataset(img_dir=tmp_path, ann_file=train_path, resize=False)
     assert len(ds) == 1
     img_tensor, target = ds[0]
@@ -223,6 +225,7 @@ def test_dentex_dataset_resizing(tmp_path):
         seed=42
     )
     
+    cv2.imwrite(str(tmp_path / "large_01.png"), np.zeros((1300, 2600, 3), np.uint8))
     # Default dataset should resize large image to safe dimensions
     ds = DentexDataset(img_dir=tmp_path, ann_file=train_path, target_short=800, max_long=1333)
     img_tensor, target = ds[0]

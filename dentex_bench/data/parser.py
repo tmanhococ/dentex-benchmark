@@ -135,6 +135,9 @@ def convert_dentex_annotations_to_coco(
     # Shuffle and split by images
     random.seed(seed)
     image_ids = [img["id"] for img in image_entries]
+    duplicates = sorted({i for i in image_ids if image_ids.count(i) > 1})
+    if duplicates:
+        raise ValueError(f"Raw annotations contain duplicate image ids {duplicates[:10]}; the train/val split would be ambiguous.")
     random.shuffle(image_ids)
     
     split_idx = int(len(image_ids) * split_ratio)

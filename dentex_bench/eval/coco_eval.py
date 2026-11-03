@@ -80,14 +80,15 @@ def evaluate_coco_predictions(ground_truth_json: Union[str, Path], predictions: 
     class_names = ["Caries", "Deep Caries", "Periapical Lesion", "Impacted Tooth"]
     per_class = {}
     for cid, cname in enumerate(class_names, start=1):
-        try:
-            cat_idx = coco_eval.params.catIds.index(cid)
-            # precisions shape: (T, R, K, A, M) where T is IoU threshold (0 is 0.50)
-            prec = coco_eval.eval["precision"][0, :, cat_idx, 0, -1]
-            prec = prec[prec > -1]
-            ap = float(prec.mean()) if len(prec) > 0 else 0.0
-        except Exception:
-            ap = 0.0
+        if not coco_gt.getAnnIds(catIds=[cid]):
+            # No lesion of this class in the ground truth: AP is undefined, not 0
+            per_class[f"AP_{cname.replace(' ', '')}"] = float("nan")
+            continue
+        cat_idx = coco_eval.params.catIds.index(cid)
+        # precisions shape: (T, R, K, A, M) where T is IoU threshold (0 is 0.50)
+        prec = coco_eval.eval["precision"][0, :, cat_idx, 0, -1]
+        prec = prec[prec > -1]
+        ap = float(prec.mean()) if len(prec) > 0 else 0.0
         per_class[f"AP_{cname.replace(' ', '')}"] = round(max(0.0, ap), 4)
 
     res = {
@@ -96,6 +97,40 @@ def evaluate_coco_predictions(ground_truth_json: Union[str, Path], predictions: 
         **per_class
     }
     return res
+
+
+def predict_dataset(runner, ann_file: Union[str, Path], img_dir: Union[str, Path]) -> tuple:
+    """
+    Runs the runner over every annotated image at original resolution.
+    Returns (predictions with boxes in original pixel coordinates, per-image latencies in ms).
+    """
+    import time
+    from dentex_bench.data.dataset import DentexDataset
+
+    dataset = DentexDataset(img_dir=img_dir, ann_file=ann_file, resize=False)
+    predictions, latencies = [], []
+    for idx in range(len(dataset)):
+        img, target = dataset[idx]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        pred = runner.predict([img])[0]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        latencies.append((time.perf_counter() - start) * 1000.0)
+        pred["image_id"] = int(target["image_id"].item())
+        predictions.append(pred)
+    return predictions, latencies
+
+
+def evaluate_runner(runner, ann_file: Union[str, Path], img_dir: Union[str, Path]) -> Dict[str, float]:
+    """COCO metrics of a runner on an annotation file, plus its median per-image latency."""
+    predictions, latencies = predict_dataset(runner, ann_file, img_dir)
+    metrics = evaluate_coco_predictions(ann_file, predictions)
+    if latencies:
+        # The first call includes CUDA/cuDNN warm-up, so report the median
+        metrics["latency_ms"] = round(float(sorted(latencies)[len(latencies) // 2]), 1)
+    return metrics
 
 
 # Interface alias

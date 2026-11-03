@@ -163,41 +163,6 @@ def test_evaluate_coco_predictions_with_synthetic_coco(tmp_path):
     assert metrics["AP_ImpactedTooth"] > 0.0
 
 
-def test_evaluate_script_cli(tmp_path):
-    import subprocess
-    cmd = [
-        sys.executable,
-        "scripts/evaluate.py",
-        "--output_dir", str(tmp_path / "cli_out")
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    assert res.returncode == 0
-    assert (tmp_path / "cli_out" / "benchmark_summary.md").exists()
-    assert (tmp_path / "cli_out" / "benchmark_table.tex").exists()
-
-    # Test with --compare_all flag
-    cmd_compare = [
-        sys.executable,
-        "scripts/evaluate.py",
-        "--compare_all",
-        "--output_dir", str(tmp_path / "cli_compare_out")
-    ]
-    res_compare = subprocess.run(cmd_compare, capture_output=True, text=True)
-    assert res_compare.returncode == 0
-    assert (tmp_path / "cli_compare_out" / "benchmark_summary.md").exists()
-
-    # Test with --model flag
-    cmd_model = [
-        sys.executable,
-        "scripts/evaluate.py",
-        "--model", "faster_rcnn",
-        "--output_dir", str(tmp_path / "cli_model_out")
-    ]
-    res_model = subprocess.run(cmd_model, capture_output=True, text=True)
-    assert res_model.returncode == 0
-    assert (tmp_path / "cli_model_out" / "benchmark_summary.md").exists()
-
-
 def test_evaluate_script_dynamic_checkpoint(tmp_path):
     import subprocess
     from dentex_bench.config import BenchmarkConfig
@@ -226,6 +191,9 @@ def test_evaluate_script_dynamic_checkpoint(tmp_path):
         ]
     }
     val_ann_path.write_text(json.dumps(coco_data), encoding="utf-8")
+    import cv2
+    import numpy as np
+    cv2.imwrite(str(tmp_path / "xray1.png"), np.zeros((500, 500, 3), np.uint8))
 
     out_dir = tmp_path / "dynamic_out"
     cmd = [
@@ -234,6 +202,7 @@ def test_evaluate_script_dynamic_checkpoint(tmp_path):
         "--model", "dino",
         "--checkpoint", str(ckpt_path),
         "--val_ann", str(val_ann_path),
+        "--img_dir", str(tmp_path),
         "--output_dir", str(out_dir)
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)

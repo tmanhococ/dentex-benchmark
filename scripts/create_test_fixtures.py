@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dentex_bench.config import BenchmarkConfig
 from dentex_bench.models import HierarchicalNetRunner, DiffusionNetRunner
+from dentex_bench.models.base import checkpoint_matches
 
 CATEGORIES = [
     {"id": 1, "name": "Caries"},
@@ -91,7 +92,8 @@ def create_sample_fixtures(data_dir: Path, outputs_dir: Path, num_samples: int =
         m_dir = outputs_dir / m_key
         m_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = m_dir / "best.pth"
-        if not ckpt_path.exists():
+        # Untrained weights: these fixtures only exercise the analysis pipeline, never report results
+        if not checkpoint_matches(ckpt_path, runner_cls):
             runner = runner_cls(cfg)
             runner.build_model(pretrained=False)
             runner.save_checkpoint(ckpt_path)

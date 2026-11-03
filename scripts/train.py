@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dentex_bench.config import BenchmarkConfig
 from dentex_bench.data.dataset import DentexDataset
+from dentex_bench.eval.coco_eval import evaluate_runner
 from dentex_bench.models import (
     FasterRCNNRunner,
     DINORunner,
@@ -50,11 +51,16 @@ def plot_training_history(history: list, output_file: Path):
     losses = [h["loss"] for h in history]
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(epochs, losses, marker="o", color="#2b5c8f", label="Training Loss")
-    ax.set_title("Training Loss Curve")
+    ax.set_title("Training Loss & Validation mAP50")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend()
+    if any("val_mAP50" in h for h in history):
+        ax2 = ax.twinx()
+        ax2.plot(epochs, [h.get("val_mAP50", float("nan")) for h in history], marker="s", color="#e27c38", label="Val mAP50")
+        ax2.set_ylabel("Val mAP50")
+        ax2.legend(loc="upper right")
+    ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(output_file, dpi=160)
     plt.close(fig)
@@ -86,30 +92,18 @@ def main(args=None):
     runner = runners[args.model](cfg)
     runner.build_model()
 
-    train_ann = Path(args.data_dir) / "processed" / "instances_train.json"
-    if not train_ann.exists():
-        fallback_ann = Path("data/processed/instances_train.json")
-        if fallback_ann.exists() and (
-            args.data_dir == "data" or
-            (Path(args.data_dir).exists() and any(Path(args.data_dir).glob("**/*.png")))
-        ):
-            train_ann = fallback_ann
-
+    data_dir = Path(args.data_dir)
+    train_ann = data_dir / "processed" / "instances_train.json"
+    val_ann = data_dir / "processed" / "instances_val.json"
     if not train_ann.exists():
         print(f"[dentex_bench] Error: Training annotations not found at {train_ann}.")
         print("Please run `python scripts/download_and_prepare.py` first.")
         return 1
 
-    img_dir = Path(args.data_dir) / "raw"
-    if not img_dir.exists() or not any(img_dir.glob("*.*")):
-        if Path(args.data_dir).exists() and any(Path(args.data_dir).glob("**/*.png")):
-            img_dir = Path(args.data_dir)
-        elif Path("data/raw").exists():
-            img_dir = Path("data/raw")
-        elif Path("data").exists():
-            img_dir = Path("data")
+    # Images are looked up recursively; a missing or mismatched image raises instead of being faked
+    img_dir = data_dir / "raw" if (data_dir / "raw").is_dir() else data_dir
 
-    dataset = DentexDataset(img_dir=img_dir, ann_file=train_ann)
+    dataset = DentexDataset(img_dir=img_dir, ann_file=train_ann, target_short=cfg.img_size, max_long=cfg.max_size)
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
@@ -121,20 +115,30 @@ def main(args=None):
     output_dir = Path(args.output_dir) / args.model
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    best_loss = float("inf")
+    if val_ann.exists():
+        print(f"best.pth is selected by validation mAP50 on {val_ann}")
+    else:
+        print(f"[dentex_bench] Warning: {val_ann} not found; best.pth falls back to the lowest training loss.")
+
+    best_score = float("-inf")
     history = []
     for epoch in range(1, cfg.epochs + 1):
         loss_dict = runner.train_epoch(dataloader, epoch)
-        current_loss = loss_dict["loss"]
-        history.append({"epoch": epoch, "loss": current_loss})
-        print(f"Epoch [{epoch}/{cfg.epochs}] - Loss: {current_loss:.4f}")
+        record = {"epoch": epoch, "loss": loss_dict["loss"]}
+        if val_ann.exists():
+            val_metrics = evaluate_runner(runner, val_ann, img_dir)
+            record.update({"val_mAP50": val_metrics["mAP50"], "val_mAP50_95": val_metrics["mAP50_95"]})
+            score = val_metrics["mAP50"]
+        else:
+            score = -loss_dict["loss"]
+        history.append(record)
+        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {v:.4f}" for k, v in record.items() if k != "epoch"))
 
         # Always update last.pth at current epoch
-        runner.save_checkpoint(output_dir / "last.pth", extra_info={"epoch": epoch, "loss": current_loss})
-        # Save best.pth when loss improves
-        if current_loss < best_loss:
-            best_loss = current_loss
-            runner.save_checkpoint(output_dir / "best.pth", extra_info={"epoch": epoch, "loss": current_loss})
+        runner.save_checkpoint(output_dir / "last.pth", extra_info=record)
+        if score > best_score:
+            best_score = score
+            runner.save_checkpoint(output_dir / "best.pth", extra_info=record)
 
     # Save history json and curve plot
     with open(output_dir / "history.json", "w", encoding="utf-8") as f:

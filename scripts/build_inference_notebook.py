@@ -1,1288 +1,533 @@
 """Programmatic generator for notebooks/dentex_inference_error_analysis.ipynb.
 
-This script constructs the publication-grade DENTEX Inference & Deep Error Analysis
-Jupyter notebook JSON with pre-formatted markdown notes, LaTeX formulas, and
-syntactically validated Python code cells. Run this script via:
+Every number, figure and statement in the generated notebook is computed from the trained
+checkpoints' predictions on the validation split. Nothing is simulated: a missing checkpoint or
+image raises instead of being replaced by a synthetic stand-in.
+
+Regenerate with:
     python scripts/build_inference_notebook.py
-to re-generate notebooks/dentex_inference_error_analysis.ipynb if template cells are modified.
 """
 import json
 from pathlib import Path
 
 
+def md(src: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": src.strip("\n").splitlines(keepends=True)}
+
+
+def code(src: str) -> dict:
+    return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+            "source": src.strip("\n").splitlines(keepends=True)}
+
+
+CELLS = [
+    md(r"""
+# DENTEX 4-Class Abnormal Tooth Detection — Inference & Error Analysis
+
+Inference and error analysis of the two benchmark detectors on the **validation split** of DENTEX
+(4 classes: Caries, Deep Caries, Periapical Lesion, Impacted Tooth).
+
+1. **HierarchicalNet** — ResNet-50 + FPN feature hierarchy, region proposals on every pyramid level, multi-level RoIAlign box head.
+2. **DiffusionNet** — DiffusionDet-style detector: Gaussian boxes are denoised by RoI-feature refinement stages (DDIM sampling with box renewal).
+
+**Integrity rules of this notebook**
+- Every metric, figure, gallery and statement below is computed from the checkpoints' predictions on real validation radiographs.
+- A missing checkpoint, a checkpoint from an older architecture, or a missing / mismatched image stops the notebook with an error — nothing is replaced by synthetic data.
+- The operating confidence threshold is chosen per model by maximising F1 on this same validation split, so P/R/F1 at that threshold are optimistic. COCO mAP does not depend on any threshold.
+
+> Regenerate with `python scripts/build_inference_notebook.py`.
+
+### Contents
+1. Setup & validation data
+2. Checkpoint loading (`best.pth`)
+3. Cohort inference & COCO metrics
+4. Confidence-threshold sweep (P / R / F1)
+5. Ground Truth vs HierarchicalNet vs DiffusionNet on a scan
+6. Error taxonomy & Confusion Matrix
+7. Success Profiling
+8. Top 5 Failure Modes (real cases)
+9. Summary generated from the measurements
+"""),
+    code(r"""
+import os
+import sys
+import json
+import time
+import random
+from collections import defaultdict, Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import seaborn as sns
+import torch
+
+plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+
+try:
+    import google.colab
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+REPO_URL = 'https://github.com/tmanhococ/dentex-benchmark.git'
+BRANCH = 'main'
+
+if IN_COLAB:
+    import subprocess
+    from google.colab import drive
+    drive.mount('/content/drive')
+    repo_root = Path('/content/dentex-benchmark')
+    if (repo_root / '.git').exists():
+        # Always analyse with the latest code; a stale clone would run old model definitions
+        subprocess.run(['git', '-C', str(repo_root), 'fetch', 'origin', BRANCH], check=True)
+        subprocess.run(['git', '-C', str(repo_root), 'reset', '--hard', f'origin/{BRANCH}'], check=True)
+    else:
+        subprocess.run(['git', 'clone', '-b', BRANCH, REPO_URL, str(repo_root)], check=True)
+    os.chdir(repo_root)
+    drive_base = Path('/content/drive/MyDrive/dentex-benchmark')
+    DATA_DIR = drive_base / 'data' if (drive_base / 'data').exists() else repo_root / 'data'
+    OUTPUTS_DIR = drive_base / 'outputs' if (drive_base / 'outputs').exists() else repo_root / 'outputs'
+else:
+    repo_root = Path.cwd().resolve()
+    if repo_root.name == 'notebooks':
+        repo_root = repo_root.parent
+        os.chdir(repo_root)
+    DATA_DIR = Path('data')
+    OUTPUTS_DIR = Path('outputs')
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from dentex_bench.config import BenchmarkConfig
+from dentex_bench.data.dataset import build_image_index, load_annotated_image
+from dentex_bench.eval.coco_eval import evaluate_coco_predictions
+from dentex_bench.models import HierarchicalNetRunner, DiffusionNetRunner
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'Platform: {"Google Colab" if IN_COLAB else "Local"} | device: {DEVICE}' + (f' ({torch.cuda.get_device_name(0)})' if DEVICE == 'cuda' else ''))
+print(f'Data: {DATA_DIR.resolve()} | Outputs: {OUTPUTS_DIR.resolve()}')
+
+CLASS_METADATA = {
+    1: {'name': 'Caries', 'color': '#E69F00'},
+    2: {'name': 'Deep Caries', 'color': '#D55E00'},
+    3: {'name': 'Periapical Lesion', 'color': '#0072B2'},
+    4: {'name': 'Impacted Tooth', 'color': '#009E73'},
+}
+CLASS_NAMES = [CLASS_METADATA[i]['name'] for i in range(1, 5)]
+
+VAL_JSON = DATA_DIR / 'processed' / 'instances_val.json'
+RAW_IMG_DIR = DATA_DIR / 'raw'
+if not VAL_JSON.exists():
+    raise FileNotFoundError(f'{VAL_JSON} not found. Run scripts/download_and_prepare.py first.')
+with open(VAL_JSON, encoding='utf-8') as f:
+    val_coco = json.load(f)
+
+val_images = {im['id']: im for im in val_coco['images']}
+gt_by_img = defaultdict(list)
+for a in val_coco['annotations']:
+    gt_by_img[a['image_id']].append(a)
+
+def gt_arrays(img_id):
+    anns = gt_by_img[img_id]
+    boxes = np.array([[a['bbox'][0], a['bbox'][1], a['bbox'][0] + a['bbox'][2], a['bbox'][1] + a['bbox'][3]] for a in anns], dtype=float).reshape(-1, 4)
+    return boxes, np.array([a['category_id'] for a in anns], dtype=int)
+
+print(f'Validation: {len(val_images)} scans, {len(val_coco["annotations"])} lesions, '
+      f'{sum(1 for i in val_images if not gt_by_img[i])} scans without any of the 4 pathologies')
+for cid, meta in CLASS_METADATA.items():
+    print(f'  {meta["name"]}: {sum(1 for a in val_coco["annotations"] if a["category_id"] == cid)}')
+
+IMAGE_INDEX = build_image_index(RAW_IMG_DIR)
+print(f'Indexed {sum(len(v) for v in IMAGE_INDEX.values())} image files ({len(IMAGE_INDEX)} distinct names) under {RAW_IMG_DIR}')
+
+def load_scan(img_meta):
+    # Raises if the radiograph is missing or if no file with that name has the annotated size
+    rgb, _ = load_annotated_image(img_meta['file_name'], img_meta.get('width'), img_meta.get('height'), RAW_IMG_DIR, IMAGE_INDEX)
+    return rgb
+"""),
+    md(r"""
+## 2. Checkpoint loading (`best.pth`)
+`best.pth` is the epoch with the highest validation mAP50 recorded by `scripts/train.py`.
+"""),
+    code(r"""
+cfg = BenchmarkConfig.from_auto_env()
+cfg.device = DEVICE
+MODEL_SPECS = {'HierarchicalNet': ('hierarchical_net', HierarchicalNetRunner),
+               'DiffusionNet': ('diffusion_net', DiffusionNetRunner)}
+MODEL_COLORS = {'HierarchicalNet': '#4C72B0', 'DiffusionNet': '#55A868'}
+
+runners, ckpt_info = {}, {}
+for name, (key, runner_cls) in MODEL_SPECS.items():
+    ckpt = OUTPUTS_DIR / key / 'best.pth'
+    if not ckpt.exists():
+        raise FileNotFoundError(f'{ckpt} not found. Train it first: python scripts/train.py --model {key}')
+    runner = runner_cls(cfg)
+    runner.build_model(pretrained=False)
+    # Raises ValueError for checkpoints written by an older architecture
+    ckpt_info[name] = runner.load_checkpoint(ckpt)
+    runners[name] = runner
+    print(f'{name}: epoch {ckpt_info[name].get("epoch")}, train loss {ckpt_info[name].get("loss")}, '
+          f'val mAP50 when selected {ckpt_info[name].get("val_mAP50")}')
+"""),
+    md(r"""
+## 3. Cohort inference & COCO metrics
+Each model runs once on every validation scan at original resolution (the runners resize and normalise internally and
+return boxes in original pixels). All predictions are kept (up to 100 per scan) for COCO mAP; later sections apply a
+confidence threshold.
+"""),
+    code(r"""
+PREDICTIONS = {name: {} for name in runners}
+LATENCIES = {name: [] for name in runners}
+
+for img_id, meta in val_images.items():
+    tensor = torch.from_numpy(load_scan(meta)).permute(2, 0, 1).float() / 255.0
+    for name, runner in runners.items():
+        if DEVICE == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = runner.predict([tensor])[0]
+        if DEVICE == 'cuda':
+            torch.cuda.synchronize()
+        LATENCIES[name].append((time.perf_counter() - t0) * 1000.0)
+        PREDICTIONS[name][img_id] = {
+            'boxes': out['boxes'].numpy().reshape(-1, 4),
+            'labels': out['labels'].numpy().astype(int),
+            'scores': out['scores'].numpy(),
+        }
+
+coco_rows = {}
+for name in runners:
+    preds = [dict(image_id=i, **p) for i, p in PREDICTIONS[name].items()]
+    metrics = evaluate_coco_predictions(VAL_JSON, preds)
+    # The first call includes CUDA warm-up, so the median is reported
+    metrics['latency_ms_median'] = round(float(np.median(LATENCIES[name])), 1)
+    coco_rows[name] = metrics
+COCO_TABLE = pd.DataFrame(coco_rows).T
+print('=== COCO metrics on the validation split ===')
+display(COCO_TABLE)
+"""),
+    md(r"""
+## 4. Confidence-threshold sweep
+Detections are matched to ground truth at IoU ≥ 0.5 (greedy by score, a prediction can only match a lesion of its own class).
+The F1-maximising threshold becomes each model's **operating threshold** for the rest of the notebook. The row at 0.30
+shows what the earlier fixed threshold gives.
+"""),
+    code(r"""
+EVAL_IOU = 0.5
+
+def iou_matrix(a, b):
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)))
+    x1 = np.maximum(a[:, None, 0], b[None, :, 0]); y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(a[:, None, 2], b[None, :, 2]); y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1]); area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    return inter / np.maximum(area_a[:, None] + area_b[None, :] - inter, 1e-9)
+
+def analyse_scan(img_id, name, thresh, iou_thresh=EVAL_IOU):
+    # Classifies every prediction above thresh (TP / Cls / Loc / Bkg / Dup) and lists missed lesions
+    gt_boxes, gt_labels = gt_arrays(img_id)
+    p = PREDICTIONS[name][img_id]
+    keep = p['scores'] >= thresh
+    pb, pl, ps = p['boxes'][keep], p['labels'][keep], p['scores'][keep]
+    ious = iou_matrix(pb, gt_boxes)
+    tp_of_gt, records = {}, []
+    for pi in np.argsort(-ps):
+        row = ious[pi] if len(gt_boxes) else np.zeros(0)
+        same = [g for g in range(len(gt_boxes)) if gt_labels[g] == pl[pi] and row[g] >= iou_thresh]
+        free = [g for g in same if g not in tp_of_gt]
+        if free:
+            g = max(free, key=lambda k: row[k]); kind = 'TP'; tp_of_gt[g] = pi
+        elif same:
+            g = max(same, key=lambda k: row[k]); kind = 'Dup'
+        elif len(row) and row.max() >= iou_thresh:
+            g = int(row.argmax()); kind = 'Cls'
+        elif len(row) and row.max() >= 0.1:
+            g = int(row.argmax()); kind = 'Loc'
+        else:
+            g = -1; kind = 'Bkg'
+        records.append({'image_id': img_id, 'kind': kind, 'pred_box': pb[pi], 'pred_label': int(pl[pi]), 'score': float(ps[pi]),
+                        'gt': g, 'gt_label': int(gt_labels[g]) if g >= 0 else None, 'gt_box': gt_boxes[g] if g >= 0 else None,
+                        'iou': float(row[g]) if g >= 0 else 0.0})
+    missed = [{'image_id': img_id, 'gt': g, 'gt_label': int(gt_labels[g]), 'gt_box': gt_boxes[g]}
+              for g in range(len(gt_boxes)) if g not in tp_of_gt]
+    return records, missed
+
+def analyse_cohort(name, thresh):
+    records, missed = [], []
+    for img_id in val_images:
+        r, m = analyse_scan(img_id, name, thresh)
+        records += r; missed += m
+    return records, missed
+
+def prf(records, missed):
+    tp = sum(r['kind'] == 'TP' for r in records); fp = len(records) - tp; fn = len(missed)
+    p = tp / (tp + fp) if tp + fp else 0.0; r = tp / (tp + fn) if tp + fn else 0.0
+    return {'TP': tp, 'FP': fp, 'FN': fn, 'precision': p, 'recall': r, 'f1': 2 * p * r / (p + r) if p + r else 0.0}
+
+THRESHOLDS = np.round(np.arange(0.05, 0.951, 0.05), 2)
+sweep = {name: pd.DataFrame([dict(threshold=t, **prf(*analyse_cohort(name, t))) for t in THRESHOLDS]) for name in runners}
+OPERATING_THRESH = {name: float(df.loc[df['f1'].idxmax(), 'threshold']) for name, df in sweep.items()}
+
+fig, axes = plt.subplots(1, len(runners), figsize=(7 * len(runners), 4.5), squeeze=False)
+for ax, (name, df) in zip(axes[0], sweep.items()):
+    for col, style in [('precision', '--'), ('recall', ':'), ('f1', '-')]:
+        ax.plot(df['threshold'], df[col], style, color=MODEL_COLORS[name], label=col)
+    ax.axvline(OPERATING_THRESH[name], color='black', alpha=0.5, label=f'max F1 @ {OPERATING_THRESH[name]:.2f}')
+    ax.set_title(f'{name}: P / R / F1 vs confidence threshold', fontweight='bold')
+    ax.set_xlabel('confidence threshold'); ax.set_ylim(0, 1); ax.legend()
+plt.tight_layout(); plt.show()
+
+for name, df in sweep.items():
+    print(f'\n{name}: operating threshold {OPERATING_THRESH[name]:.2f}')
+    display(df[df['threshold'].isin([0.3, OPERATING_THRESH[name]])].round(3))
+"""),
+    md(r"""
+## 5. Ground Truth vs HierarchicalNet vs DiffusionNet on a scan
+Set `SAMPLE_IMAGE_ID` to inspect a specific scan; `None` picks one at random.
+"""),
+    code(r"""
+def draw_boxes(ax, boxes, labels, scores=None, dashed=False):
+    for i, (b, c) in enumerate(zip(boxes, labels)):
+        meta = CLASS_METADATA[int(c)]
+        ax.add_patch(patches.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], linewidth=2.2,
+                                       edgecolor=meta['color'], facecolor='none', linestyle='--' if dashed else '-'))
+        text = meta['name'] + (f' {scores[i]:.2f}' if scores is not None else '')
+        ax.text(b[0], max(0.0, b[1] - 5), text, color='white', fontsize=8, fontweight='bold',
+                bbox=dict(boxstyle='square,pad=0.2', facecolor=meta['color'], alpha=0.9, edgecolor='none'))
+
+def show_scan(img_id):
+    meta = val_images[img_id]
+    rgb = load_scan(meta)
+    gt_boxes, gt_labels = gt_arrays(img_id)
+    fig, axes = plt.subplots(1, 1 + len(runners), figsize=(8 * (1 + len(runners)), 5))
+    axes[0].imshow(rgb); draw_boxes(axes[0], gt_boxes, gt_labels)
+    axes[0].set_title(f'Ground Truth ({len(gt_boxes)} lesions)', fontweight='bold')
+    for ax, name in zip(axes[1:], runners):
+        thr = OPERATING_THRESH[name]
+        p = PREDICTIONS[name][img_id]; keep = p['scores'] >= thr
+        stats = prf(*analyse_scan(img_id, name, thr))
+        ax.imshow(rgb); draw_boxes(ax, p['boxes'][keep], p['labels'][keep], p['scores'][keep])
+        ax.set_title(f'{name} (conf ≥ {thr:.2f}): {int(keep.sum())} boxes | TP {stats["TP"]} FP {stats["FP"]} FN {stats["FN"]}', fontweight='bold')
+    for ax in axes:
+        ax.axis('off')
+    handles = [patches.Patch(color=CLASS_METADATA[c]['color'], label=CLASS_METADATA[c]['name']) for c in CLASS_METADATA]
+    fig.legend(handles=handles, loc='lower center', ncol=4)
+    fig.suptitle(f'Scan {img_id} ({meta["file_name"]}, {meta["width"]}x{meta["height"]})', fontweight='bold')
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95]); plt.show()
+
+SAMPLE_IMAGE_ID = None
+show_scan(SAMPLE_IMAGE_ID if SAMPLE_IMAGE_ID in val_images else random.Random(0).choice(list(val_images)))
+"""),
+    md(r"""
+## 6. Error taxonomy & Confusion Matrix (at each model's operating threshold)
+- **Cls**: overlaps a lesion (IoU ≥ 0.5) but with the wrong class · **Loc**: right area, 0.1 ≤ IoU < 0.5 · **Bkg**: IoU < 0.1 with every lesion
+- **Dup**: second detection of an already-found lesion · **Missed**: lesion with no correct detection
+
+Confusion-matrix rows are ground-truth lesions: a missed lesion is counted under the class of the highest-scoring
+wrong-class detection overlapping it, otherwise under *Missed*.
+"""),
+    code(r"""
+COHORT = {name: analyse_cohort(name, OPERATING_THRESH[name]) for name in runners}
+KINDS = ['Cls', 'Loc', 'Bkg', 'Dup']
+
+error_counts = pd.DataFrame({
+    name: {**{k: sum(r['kind'] == k for r in recs) for k in ['TP'] + KINDS}, 'Missed': len(missed)}
+    for name, (recs, missed) in COHORT.items()
+}).T
+display(error_counts)
+
+ax = error_counts[KINDS + ['Missed']].T.plot.bar(figsize=(11, 4.5), color=[MODEL_COLORS[n] for n in error_counts.index], edgecolor='black')
+ax.set_title('Error taxonomy at the operating threshold', fontweight='bold'); ax.set_ylabel('count')
+for c in ax.containers:
+    ax.bar_label(c, fontsize=8)
+plt.xticks(rotation=0); plt.tight_layout(); plt.show()
+
+def confusion(recs, missed):
+    cm = np.zeros((4, 5), dtype=int)
+    cls_err = defaultdict(list)
+    for r in recs:
+        if r['kind'] == 'TP':
+            cm[r['gt_label'] - 1, r['gt_label'] - 1] += 1
+        elif r['kind'] == 'Cls':
+            cls_err[(r['image_id'], r['gt'])].append(r)
+    for m in missed:
+        wrong = cls_err.get((m['image_id'], m['gt']))
+        col = max(wrong, key=lambda r: r['score'])['pred_label'] - 1 if wrong else 4
+        cm[m['gt_label'] - 1, col] += 1
+    return cm
+
+fig, axes = plt.subplots(1, len(runners), figsize=(9 * len(runners), 6.5), squeeze=False)
+for ax, (name, (recs, missed)) in zip(axes[0], COHORT.items()):
+    cm = confusion(recs, missed)
+    norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1) * 100
+    annot = np.array([[f'{cm[r, c]}\n({norm[r, c]:.1f}%)' for c in range(5)] for r in range(4)])
+    sns.heatmap(norm, annot=annot, fmt='', cmap='Blues', vmin=0, vmax=100, ax=ax,
+                xticklabels=CLASS_NAMES + ['Missed'], yticklabels=CLASS_NAMES)
+    ax.set_title(f'Confusion Matrix: {name} (conf ≥ {OPERATING_THRESH[name]:.2f})', fontweight='bold')
+    ax.set_xlabel('Predicted'); ax.set_ylabel('Ground Truth')
+plt.tight_layout(); plt.show()
+"""),
+    md(r"""
+## 7. Success Profiling
+Almost every DENTEX lesion is COCO-"large" (≥ 96² px), so lesion size is split into validation-set terciles instead.
+"""),
+    code(r"""
+all_areas = np.array([a['bbox'][2] * a['bbox'][3] for a in val_coco['annotations']], dtype=float)
+edges = np.quantile(all_areas, [0, 1 / 3, 2 / 3, 1]) if len(all_areas) else np.array([0, 1, 2, 3])
+size_names = [f'{"small" if i == 0 else "medium" if i == 1 else "large"} tercile\n({edges[i]:.0f}–{edges[i + 1]:.0f} px²)' for i in range(3)]
+
+def size_bin(box):
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    return int(np.clip(np.searchsorted(edges, area, side='right') - 1, 0, 2))
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+width = 0.8 / len(runners)
+for k, (name, (recs, missed)) in enumerate(COHORT.items()):
+    tps = [r for r in recs if r['kind'] == 'TP']
+    color = MODEL_COLORS[name]
+    # A: recall per class
+    rec_cls = [sum(r['gt_label'] == c for r in tps) / max(1, sum(r['gt_label'] == c for r in tps) + sum(m['gt_label'] == c for m in missed)) for c in range(1, 5)]
+    axes[0, 0].bar(np.arange(4) + k * width, rec_cls, width, label=name, color=color, edgecolor='black')
+    # B: recall per size tercile
+    hit = Counter(size_bin(r['gt_box']) for r in tps); miss = Counter(size_bin(m['gt_box']) for m in missed)
+    axes[0, 1].bar(np.arange(3) + k * width, [hit[i] / max(1, hit[i] + miss[i]) for i in range(3)], width, label=name, color=color, edgecolor='black')
+    # C: score distribution of TPs vs false positives
+    axes[1, 0].hist([r['score'] for r in tps], bins=np.linspace(0, 1, 21), alpha=0.6, color=color, label=f'{name} TP (n={len(tps)})')
+    axes[1, 0].hist([r['score'] for r in recs if r['kind'] != 'TP'], bins=np.linspace(0, 1, 21), histtype='step', linewidth=2,
+                    color=color, label=f'{name} FP (n={len(recs) - len(tps)})')
+    # D: localisation quality of TPs
+    if tps:
+        axes[1, 1].hist([r['iou'] for r in tps], bins=np.linspace(0.5, 1, 11), alpha=0.6, color=color, label=f'{name} (mean IoU {np.mean([r["iou"] for r in tps]):.2f})')
+
+axes[0, 0].set_xticks(np.arange(4) + width / 2); axes[0, 0].set_xticklabels(CLASS_NAMES); axes[0, 0].set_ylim(0, 1)
+axes[0, 0].set_title('A: Recall per pathology', fontweight='bold')
+axes[0, 1].set_xticks(np.arange(3) + width / 2); axes[0, 1].set_xticklabels(size_names); axes[0, 1].set_ylim(0, 1)
+axes[0, 1].set_title('B: Recall per lesion-size tercile', fontweight='bold')
+axes[1, 0].set_title('C: Confidence of true vs false positives', fontweight='bold'); axes[1, 0].set_xlabel('score')
+axes[1, 1].set_title('D: IoU of true positives', fontweight='bold'); axes[1, 1].set_xlabel('IoU')
+for ax in axes.flat:
+    ax.legend(fontsize=9)
+plt.suptitle('Success Profiling (operating thresholds)', fontweight='bold'); plt.tight_layout(); plt.show()
+"""),
+    md(r"""
+## 8. Top 5 Failure Modes (real validation cases)
+Failure modes are defined from the error records — missed lesions per class, class confusions per (true → predicted)
+pair, poorly localised detections per class, background detections per predicted class and duplicates — and ranked by
+their total count over both models. Each row shows real crops: solid = ground truth, dashed = prediction.
+"""),
+    code(r"""
+def mode_key(item):
+    if 'kind' not in item:
+        return f'Missed {CLASS_METADATA[item["gt_label"]]["name"]}'
+    if item['kind'] == 'Cls':
+        return f'{CLASS_METADATA[item["gt_label"]]["name"]} predicted as {CLASS_METADATA[item["pred_label"]]["name"]}'
+    if item['kind'] == 'Loc':
+        return f'Poorly localised {CLASS_METADATA[item["pred_label"]]["name"]}'
+    if item['kind'] == 'Bkg':
+        return f'Background detected as {CLASS_METADATA[item["pred_label"]]["name"]}'
+    return 'Duplicate detection'
+
+failures = defaultdict(lambda: defaultdict(list))
+for name, (recs, missed) in COHORT.items():
+    for item in [r for r in recs if r['kind'] != 'TP'] + missed:
+        failures[mode_key(item)][name].append(item)
+
+ranked = sorted(failures, key=lambda k: -sum(len(v) for v in failures[k].values()))
+TOP_MODES = ranked[:5]
+print(pd.DataFrame({name: {m: len(failures[m][name]) for m in TOP_MODES} for name in runners}).to_string())
+
+def crop_example(ax, item, name):
+    rgb = load_scan(val_images[item['image_id']])
+    boxes = [b for b in (item.get('gt_box'), item.get('pred_box')) if b is not None]
+    x1 = min(b[0] for b in boxes); y1 = min(b[1] for b in boxes); x2 = max(b[2] for b in boxes); y2 = max(b[3] for b in boxes)
+    pad = 0.6 * max(x2 - x1, y2 - y1)
+    cx1, cy1 = int(max(0, x1 - pad)), int(max(0, y1 - pad))
+    cx2, cy2 = int(min(rgb.shape[1], x2 + pad)), int(min(rgb.shape[0], y2 + pad))
+    ax.imshow(rgb[cy1:cy2, cx1:cx2])
+    shift = np.array([cx1, cy1, cx1, cy1])
+    if item.get('gt_box') is not None:
+        draw_boxes(ax, [item['gt_box'] - shift], [item['gt_label']])
+    if item.get('pred_box') is not None:
+        draw_boxes(ax, [item['pred_box'] - shift], [item['pred_label']], [item['score']], dashed=True)
+    ax.set_title(f'{name} | scan {item["image_id"]}' + (f' | IoU {item["iou"]:.2f}' if 'iou' in item else ''), fontsize=9)
+
+if TOP_MODES:
+    fig, axes = plt.subplots(len(TOP_MODES), 3, figsize=(15, 4.2 * len(TOP_MODES)), squeeze=False)
+    for row, mode in enumerate(TOP_MODES):
+        # Highest-confidence false positives, or the largest missed lesions
+        examples = [(name, it) for name, items in failures[mode].items() for it in items]
+        examples.sort(key=lambda e: -(e[1]['score'] if 'score' in e[1] else
+                                      (e[1]['gt_box'][2] - e[1]['gt_box'][0]) * (e[1]['gt_box'][3] - e[1]['gt_box'][1])))
+        for col in range(3):
+            ax = axes[row, col]
+            ax.axis('off')
+            if col < len(examples):
+                crop_example(ax, examples[col][1], examples[col][0])
+        axes[row, 0].text(0, 1.18, f'#{row + 1} {mode}', transform=axes[row, 0].transAxes, fontsize=12, fontweight='bold')
+    plt.suptitle('Top 5 Failure Modes — real validation cases (solid = Ground Truth, dashed = prediction)', fontweight='bold')
+    plt.tight_layout(); plt.show()
+else:
+    print('No failures at the operating thresholds.')
+"""),
+    md(r"""
+## 9. Summary generated from the measurements
+"""),
+    code(r"""
+from IPython.display import Markdown
+
+op = {name: prf(*COHORT[name]) for name in runners}
+names = list(runners)
+lines = ['| Metric | ' + ' | '.join(names) + ' |', '|---|' + '---|' * len(names)]
+for label, fn in [
+    ('COCO mAP50', lambda n: f'{COCO_TABLE.loc[n, "mAP50"]:.3f}'),
+    ('COCO mAP50:95', lambda n: f'{COCO_TABLE.loc[n, "mAP50_95"]:.3f}'),
+    *[(f'AP50 {c}', (lambda key: lambda n: f'{COCO_TABLE.loc[n, key]:.3f}')(f'AP_{c.replace(" ", "")}')) for c in CLASS_NAMES],
+    ('Operating threshold (max F1 on val)', lambda n: f'{OPERATING_THRESH[n]:.2f}'),
+    ('Precision / Recall / F1 @ operating threshold', lambda n: f'{op[n]["precision"]:.3f} / {op[n]["recall"]:.3f} / {op[n]["f1"]:.3f}'),
+    ('Median latency per scan', lambda n: f'{COCO_TABLE.loc[n, "latency_ms_median"]:.0f} ms'),
+    ('Most frequent error', lambda n: error_counts.loc[n, KINDS + ['Missed']].idxmax() if error_counts.loc[n, KINDS + ['Missed']].sum() else 'none'),
+]:
+    lines.append(f'| {label} | ' + ' | '.join(fn(n) for n in names) + ' |')
+
+best = max(names, key=lambda n: COCO_TABLE.loc[n, 'mAP50'])
+notes = [f'- Higher COCO mAP50: **{best}** ({COCO_TABLE.loc[best, "mAP50"]:.3f}).']
+for n in names:
+    # Classes without validation lesions have an undefined (NaN) AP and are left out
+    ap = {c: COCO_TABLE.loc[n, f'AP_{c.replace(" ", "")}'] for c in CLASS_NAMES if not np.isnan(COCO_TABLE.loc[n, f'AP_{c.replace(" ", "")}'])}
+    if not ap:
+        continue
+    notes.append(f'- {n}: weakest class {min(ap, key=ap.get)} (AP50 {min(ap.values()):.3f}), strongest {max(ap, key=ap.get)} (AP50 {max(ap.values()):.3f}).')
+notes.append(f'- Top failure mode overall: {TOP_MODES[0] if TOP_MODES else "none"}.')
+notes += [
+    f'- Caveats: one split of {len(val_images)} scans; Periapical Lesion has only '
+    f'{sum(1 for a in val_coco["annotations"] if a["category_id"] == 3)} validation lesions, so its AP is noisy; '
+    'operating thresholds were tuned on this split.',
+]
+display(Markdown('\n'.join(lines) + '\n\n' + '\n'.join(notes)))
+"""),
+]
+
+
 def build_notebook():
-    cells = []
-
-    # =========================================================================
-    # Cell 0: Title, Overview & Clinical Architecture (Markdown)
-    # =========================================================================
-    cells.append({
-        "cell_type": "markdown",
-        "metadata": {},
-        "source": [
-            "# DENTEX 4-Class Abnormal Tooth Detection — Inference & Deep Error Analysis\n",
-            "\n",
-            "This interactive notebook provides a publication-grade inference benchmark and comprehensive error analysis for abnormal tooth detection on panoramic dental radiographs from the **DENTEX Challenge**.\n",
-            "\n",
-            "### Comparative Models Evaluated:\n",
-            "1. **HierarchicalNet**: Deterministic multi-scale Feature Pyramid Network (FPN) with hierarchical queries for multi-scale dental pathology detection.\n",
-            "2. **DiffusionNet**: Generative reverse diffusion model iteratively refining bounding box proposals conditioned on multi-scale radiographic features.\n",
-            "\n",
-            "### Target Pathology Classes & Publication Color Palette:\n",
-            "- **Class 1: Caries** (`#E69F00` - Orange): Enamel and superficial dentin demineralization.\n",
-            "- **Class 2: Deep Caries** (`#D55E00` - Vermilion): Severe carious lesions approaching or exposing the dental pulp chamber.\n",
-            "- **Class 3: Periapical Lesion** (`#0072B2` - Blue): Radiolucent osteolytic lesions at tooth root apices (periapical granuloma, cyst, or abscess).\n",
-            "- **Class 4: Impacted Tooth** (`#009E73` - Green): Unerupted or partially erupted tooth impeded by adjacent teeth, dense bone, or soft tissue.\n",
-            "\n",
-            "> **Note on Maintenance & Generation**: This notebook is self-contained and can be executed directly in Jupyter, VS Code, or Google Colab. It can also be programmatically regenerated or synchronized via `python scripts/build_inference_notebook.py`.\n",
-            "\n",
-            "---\n",
-            "### Notebook Structure:\n",
-            "1. **Environment Setup & Checkpoint Resolution**: Dual Google Colab / Google Drive and local workspace detection.\n",
-            "2. **Model Checkpoint Loader**: Instantiates and loads `HierarchicalNetRunner` and `DiffusionNetRunner` from `best.pth` checkpoints.\n",
-            "3. **3-Panel Side-by-Side Visualizer**: Synchronized comparison (`Ground Truth | HierarchicalNet | DiffusionNet`).\n",
-            "4. **Interactive Random & Specific Image Sampler**: Scan sampler with configurable confidence and IoU thresholds.\n",
-            "5. **Quantitative Error Breakdown & 4x5 Confusion Matrix**: TIDE/COCO error taxonomy decomposition and multi-class confusion matrices.\n",
-            "6. **Success Profiling**: Geometric, scale, and confidence calibration profiles of correct detections.\n",
-            "7. **Deep Analysis of Top 5 Failure Modes**: In-depth clinical failure analysis with case galleries.\n",
-            "8. **Clinical Comparative Synthesis Report**: Translation to chairside dental radiology practice.\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 1: Environment Setup, Auto-Resolution & Data Ingestion (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "import os\n",
-            "import sys\n",
-            "import json\n",
-            "import math\n",
-            "import random\n",
-            "import time\n",
-            "import copy\n",
-            "from collections import defaultdict\n",
-            "from pathlib import Path\n",
-            "from typing import Dict, List, Tuple, Any, Optional\n",
-            "\n",
-            "import numpy as np\n",
-            "import pandas as pd\n",
-            "import matplotlib.pyplot as plt\n",
-            "import matplotlib.patches as patches\n",
-            "import seaborn as sns\n",
-            "import cv2\n",
-            "import torch\n",
-            "import torch.nn.functional as F\n",
-            "\n",
-            "# Visual styling for publication figures\n",
-            "plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')\n",
-            "plt.rcParams['font.sans-serif'] = 'DejaVu Sans'\n",
-            "plt.rcParams['axes.edgecolor'] = '#333333'\n",
-            "plt.rcParams['axes.linewidth'] = 0.8\n",
-            "\n",
-            "# Environment auto-detection: Google Colab vs Local\n",
-            "try:\n",
-            "    import google.colab\n",
-            "    IN_COLAB = True\n",
-            "except ImportError:\n",
-            "    IN_COLAB = False\n",
-            "\n",
-            "REPO_URL = 'https://github.com/tmanhococ/dentex-benchmark.git'\n",
-            "BRANCH = 'main'\n",
-            "\n",
-            "if IN_COLAB:\n",
-            "    import subprocess\n",
-            "    # 1. Mount Google Drive\n",
-            "    try:\n",
-            "        from google.colab import drive\n",
-            "        drive.mount('/content/drive')\n",
-            "    except Exception as e:\n",
-            "        print(f'Drive mount info/warning: {e}')\n",
-            "\n",
-            "    # 2. Locate or clone dentex-benchmark repository\n",
-            "    candidates = [\n",
-            "        Path('/content/dentex-benchmark'),\n",
-            "        Path('/content/drive/MyDrive/dentex-benchmark'),\n",
-            "        Path.cwd(),\n",
-            "        Path.cwd().parent\n",
-            "    ]\n",
-            "    repo_root = None\n",
-            "    for cand in candidates:\n",
-            "        if (cand / 'dentex_bench').exists():\n",
-            "            repo_root = cand.resolve()\n",
-            "            break\n",
-            "\n",
-            "    if repo_root is None:\n",
-            "        target_dir = Path('/content/dentex-benchmark')\n",
-            "        print(f'🚀 Cloning {REPO_URL} into {target_dir}...')\n",
-            "        subprocess.run(['git', 'clone', '-b', BRANCH, REPO_URL, str(target_dir)], check=True)\n",
-            "        repo_root = target_dir\n",
-            "\n",
-            "    os.chdir(repo_root)\n",
-            "    if str(repo_root) not in sys.path:\n",
-            "        sys.path.insert(0, str(repo_root))\n",
-            "\n",
-            "    # Install any missing dependencies if needed\n",
-            "    for pkg in ['transformers', 'pycocotools', 'albumentations']:\n",
-            "        try:\n",
-            "            __import__(pkg)\n",
-            "        except ImportError:\n",
-            "            print(f'📦 Installing missing dependency {pkg}...')\n",
-            "            subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', pkg], check=True)\n",
-            "\n",
-            "    drive_base = Path('/content/drive/MyDrive/dentex-benchmark')\n",
-            "    if (drive_base / 'data').exists():\n",
-            "        DATA_DIR = drive_base / 'data'\n",
-            "    elif (repo_root / 'data').exists():\n",
-            "        DATA_DIR = repo_root / 'data'\n",
-            "    else:\n",
-            "        DATA_DIR = Path('data')\n",
-            "\n",
-            "    if (drive_base / 'outputs').exists():\n",
-            "        OUTPUTS_DIR = drive_base / 'outputs'\n",
-            "    elif (repo_root / 'outputs').exists():\n",
-            "        OUTPUTS_DIR = repo_root / 'outputs'\n",
-            "    else:\n",
-            "        OUTPUTS_DIR = Path('outputs')\n",
-            "else:\n",
-            "    # Ensure project root is in sys.path for local workspace\n",
-            "    project_root = Path.cwd().resolve()\n",
-            "    if project_root.name == 'notebooks':\n",
-            "        project_root = project_root.parent\n",
-            "        os.chdir(project_root)\n",
-            "    if str(project_root) not in sys.path:\n",
-            "        sys.path.insert(0, str(project_root))\n",
-            "    DATA_DIR = Path('data')\n",
-            "    OUTPUTS_DIR = Path('outputs')\n",
-            "\n",
-            "DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'\n",
-            "print(f'Execution platform: {\"Google Colab\" if IN_COLAB else \"Local Workspace\"}')\n",
-            "print(f'Active working dir: {Path.cwd()}')\n",
-            "print(f'Hardware device: {DEVICE.upper()}' + (f' ({torch.cuda.get_device_name(0)})' if DEVICE == 'cuda' else ''))\n",
-            "print(f'Data directory: {DATA_DIR.resolve()}')\n",
-            "print(f'Outputs directory: {OUTPUTS_DIR.resolve()}')\n",
-            "\n",
-            "# Clinical 4-class ontology and publication color scheme\n",
-            "CLASS_METADATA = {\n",
-            "    1: {'name': 'Caries', 'color': '#E69F00', 'desc': 'Enamel/dentin demineralization'},\n",
-            "    2: {'name': 'Deep Caries', 'color': '#D55E00', 'desc': 'Pulpal proximity/exposure'},\n",
-            "    3: {'name': 'Periapical Lesion', 'color': '#0072B2', 'desc': 'Apical osteolytic rarefaction'},\n",
-            "    4: {'name': 'Impacted Tooth', 'color': '#009E73', 'desc': 'Impeded path of eruption'},\n",
-            "}\n",
-            "CLASS_NAMES = [CLASS_METADATA[i]['name'] for i in range(1, 5)]\n",
-            "CLASS_COLORS = [CLASS_METADATA[i]['color'] for i in range(1, 5)]\n",
-            "\n",
-            "# Load validation dataset annotations\n",
-            "VAL_JSON = DATA_DIR / 'processed' / 'instances_val.json'\n",
-            "RAW_IMG_DIR = DATA_DIR / 'raw'\n",
-            "\n",
-            "if not VAL_JSON.exists():\n",
-            "    # Fallback to sample data if standard path is empty\n",
-            "    sample_val = DATA_DIR / 'sample' / 'processed' / 'instances_val.json'\n",
-            "    if sample_val.exists():\n",
-            "        VAL_JSON = sample_val\n",
-            "        RAW_IMG_DIR = DATA_DIR / 'sample' / 'raw'\n",
-            "\n",
-            "val_coco_data = {'images': [], 'annotations': [], 'categories': []}\n",
-            "if VAL_JSON.exists():\n",
-            "    with open(VAL_JSON, 'r', encoding='utf-8') as f:\n",
-            "        val_coco_data = json.load(f)\n",
-            "\n",
-            "val_images_dict = {im['id']: im for im in val_coco_data.get('images', [])}\n",
-            "val_annotations_by_img = defaultdict(list)\n",
-            "for ann in val_coco_data.get('annotations', []):\n",
-            "    val_annotations_by_img[ann['image_id']].append(ann)\n",
-            "\n",
-            "print(f'Ingested validation data: {len(val_images_dict)} scans, {len(val_coco_data.get(\"annotations\", []))} ground truth lesions.')\n",
-            "for cid, meta in CLASS_METADATA.items():\n",
-            "    cnt = sum(1 for a in val_coco_data.get('annotations', []) if a['category_id'] == cid)\n",
-            "    print(f'  Class {cid} ({meta[\"name\"]}): {cnt} instances')\n",
-            "\n",
-            "# Index all available scan images across search roots\n",
-            "IMAGE_LOOKUP = {}\n",
-            "for s_root in [RAW_IMG_DIR, DATA_DIR / 'raw', DATA_DIR, Path('/content/dentex-benchmark/data'), Path('/content/drive/MyDrive/dentex-benchmark/data'), Path('data')]:\n",
-            "    try:\n",
-            "        if s_root.exists():\n",
-            "            for p in s_root.glob('**/*'):\n",
-            "                if p.is_file() and p.suffix.lower() in ('.png', '.jpg', '.jpeg'):\n",
-            "                    if p.name not in IMAGE_LOOKUP:\n",
-            "                        IMAGE_LOOKUP[p.name] = p\n",
-            "                        IMAGE_LOOKUP[p.name.lower()] = p\n",
-            "    except Exception:\n",
-            "        pass\n",
-            "print(f'Discovered {len(IMAGE_LOOKUP)} scan images indexed on disk.')\n",
-            "\n",
-            "def load_scan_image(file_name: str, fallback_h: int = 500, fallback_w: int = 1000) -> Tuple[np.ndarray, np.ndarray, Path]:\n",
-            "    \"\"\"Finds and loads a radiograph from disk, or safely synthesizes a gradient canvas with 0 broadcasting errors.\"\"\"\n",
-            "    base_name = Path(file_name).name\n",
-            "    img_path = None\n",
-            "    if base_name in IMAGE_LOOKUP:\n",
-            "        img_path = IMAGE_LOOKUP[base_name]\n",
-            "    elif base_name.lower() in IMAGE_LOOKUP:\n",
-            "        img_path = IMAGE_LOOKUP[base_name.lower()]\n",
-            "    else:\n",
-            "        for cand in [RAW_IMG_DIR / file_name, RAW_IMG_DIR / base_name, DATA_DIR / 'raw' / file_name, DATA_DIR / 'raw' / base_name, DATA_DIR / file_name, DATA_DIR / 'sample' / 'raw' / base_name]:\n",
-            "            if cand.exists() and cand.is_file():\n",
-            "                img_path = cand\n",
-            "                break\n",
-            "        if img_path is None:\n",
-            "            matches = list(DATA_DIR.glob(f'**/{base_name}'))\n",
-            "            if matches:\n",
-            "                img_path = matches[0]\n",
-            "    if img_path is not None and img_path.exists() and img_path.is_file():\n",
-            "        loaded_bgr = cv2.imread(str(img_path))\n",
-            "        if loaded_bgr is not None and loaded_bgr.size > 0:\n",
-            "            if loaded_bgr.ndim == 2:\n",
-            "                loaded_rgb = cv2.cvtColor(loaded_bgr, cv2.COLOR_GRAY2RGB)\n",
-            "                loaded_bgr = cv2.cvtColor(loaded_rgb, cv2.COLOR_RGB2BGR)\n",
-            "            elif loaded_bgr.shape[2] == 4:\n",
-            "                loaded_rgb = cv2.cvtColor(loaded_bgr, cv2.COLOR_BGRA2RGB)\n",
-            "                loaded_bgr = cv2.cvtColor(loaded_rgb, cv2.COLOR_RGB2BGR)\n",
-            "            else:\n",
-            "                loaded_rgb = cv2.cvtColor(loaded_bgr, cv2.COLOR_BGR2RGB)\n",
-            "            return loaded_rgb, loaded_bgr, img_path\n",
-            "    # Safe synthetic radiograph fallback (never raises ValueError broadcasting error)\n",
-            "    h = int(fallback_h or 500)\n",
-            "    w = int(fallback_w or 1000)\n",
-            "    grad_1d = np.linspace(40, 200, w, dtype=np.uint8)\n",
-            "    gray = np.tile(grad_1d, (h, 1))\n",
-            "    cv2.ellipse(gray, (w // 2, h - 50), (w // 3, h // 2), 0, 180, 360, 230, max(2, int(min(h, w) * 0.015)))\n",
-            "    synth_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)\n",
-            "    synth_bgr = cv2.cvtColor(synth_rgb, cv2.COLOR_RGB2BGR)\n",
-            "    return synth_rgb, synth_bgr, (img_path or Path(file_name))\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 2: Model Checkpoint Loader (HierarchicalNet & DiffusionNet) (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "# Robust import guard for dentex_bench\n",
-            "try:\n",
-            "    from dentex_bench.config import BenchmarkConfig\n",
-            "    from dentex_bench.models import HierarchicalNetRunner, DiffusionNetRunner\n",
-            "except ModuleNotFoundError:\n",
-            "    for cand in [Path('/content/dentex-benchmark'), Path('/content/drive/MyDrive/dentex-benchmark'), Path.cwd(), Path.cwd().parent]:\n",
-            "        if (cand / 'dentex_bench').exists() and str(cand.resolve()) not in sys.path:\n",
-            "            sys.path.insert(0, str(cand.resolve()))\n",
-            "    from dentex_bench.config import BenchmarkConfig\n",
-            "    from dentex_bench.models import HierarchicalNetRunner, DiffusionNetRunner\n",
-            "\n",
-            "# Benchmark configuration\n",
-            "cfg = BenchmarkConfig.from_auto_env()\n",
-            "cfg.device = DEVICE\n",
-            "\n",
-            "# Instantiate HierarchicalNet and DiffusionNet runners\n",
-            "print('[1/2] Initializing HierarchicalNet detector (FPN + Hierarchical Head)...')\n",
-            "hnet_runner = HierarchicalNetRunner(cfg)\n",
-            "hnet_runner.build_model(pretrained=False)\n",
-            "\n",
-            "print('[2/2] Initializing DiffusionNet detector (Reverse Diffusion Denoising)...')\n",
-            "dnet_runner = DiffusionNetRunner(cfg)\n",
-            "dnet_runner.build_model(pretrained=False)\n",
-            "\n",
-            "# Locate best.pth checkpoints\n",
-            "hnet_ckpt_path = OUTPUTS_DIR / 'hierarchical_net' / 'best.pth'\n",
-            "dnet_ckpt_path = OUTPUTS_DIR / 'diffusion_net' / 'best.pth'\n",
-            "\n",
-            "if not hnet_ckpt_path.exists():\n",
-            "    alt_path = Path('outputs/hierarchical_net/best.pth')\n",
-            "    if alt_path.exists():\n",
-            "        hnet_ckpt_path = alt_path\n",
-            "\n",
-            "if not dnet_ckpt_path.exists():\n",
-            "    alt_path = Path('outputs/diffusion_net/best.pth')\n",
-            "    if alt_path.exists():\n",
-            "        dnet_ckpt_path = alt_path\n",
-            "\n",
-            "if hnet_ckpt_path.exists():\n",
-            "    hnet_runner.load_checkpoint(hnet_ckpt_path)\n",
-            "    print(f'HierarchicalNet: Successfully restored checkpoint from {hnet_ckpt_path}')\n",
-            "else:\n",
-            "    print(f'HierarchicalNet: No checkpoint found at {hnet_ckpt_path}. Operating with initialized model.')\n",
-            "\n",
-            "if dnet_ckpt_path.exists():\n",
-            "    dnet_runner.load_checkpoint(dnet_ckpt_path)\n",
-            "    print(f'DiffusionNet: Successfully restored checkpoint from {dnet_ckpt_path}')\n",
-            "else:\n",
-            "    print(f'DiffusionNet: No checkpoint found at {dnet_ckpt_path}. Operating with initialized model.')\n",
-            "\n",
-            "hnet_runner.model.eval()\n",
-            "dnet_runner.model.eval()\n",
-            "\n",
-            "# Standard inference helper function\n",
-            "def predict_single_scan(runner, img_bgr: np.ndarray, conf_thresh: float = 0.0) -> Dict[str, Any]:\n",
-            "    \"\"\"\n",
-            "    Runs inference on a single dental radiograph image array.\n",
-            "    Returns predictions formatted with pixel xyxy and xywh bounding boxes.\n",
-            "    \"\"\"\n",
-            "    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB) if len(img_bgr.shape) == 3 and img_bgr.shape[2] == 3 else img_bgr\n",
-            "    if len(img_rgb.shape) == 2:\n",
-            "        img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)\n",
-            "    \n",
-            "    h, w = img_rgb.shape[:2]\n",
-            "    img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0\n",
-            "    \n",
-            "    t0 = time.perf_counter()\n",
-            "    with torch.no_grad():\n",
-            "        preds = runner.predict([img_tensor])\n",
-            "    latency_ms = (time.perf_counter() - t0) * 1000.0\n",
-            "    \n",
-            "    pred = preds[0] if preds else {'boxes': torch.zeros((0, 4)), 'labels': torch.zeros((0,), dtype=torch.long), 'scores': torch.zeros((0,))}\n",
-            "    scores = pred['scores'].cpu().numpy()\n",
-            "    keep = scores >= conf_thresh\n",
-            "    \n",
-            "    boxes_xyxy = pred['boxes'][keep].cpu().numpy().tolist()\n",
-            "    labels = pred['labels'][keep].cpu().numpy().tolist()\n",
-            "    filtered_scores = scores[keep].tolist()\n",
-            "    \n",
-            "    boxes_xywh = [\n",
-            "        [float(b[0]), float(b[1]), float(max(0.0, b[2] - b[0])), float(max(0.0, b[3] - b[1]))]\n",
-            "        for b in boxes_xyxy\n",
-            "    ]\n",
-            "    \n",
-            "    return {\n",
-            "        'boxes_xyxy': boxes_xyxy,\n",
-            "        'boxes_xywh': boxes_xywh,\n",
-            "        'labels': labels,\n",
-            "        'scores': filtered_scores,\n",
-            "        'latency_ms': latency_ms\n",
-            "    }\n",
-            "\n",
-            "# Dry run verification on a synthetic radiograph canvas\n",
-            "test_canvas = np.full((400, 800, 3), 120, dtype=np.uint8)\n",
-            "res_h_test = predict_single_scan(hnet_runner, test_canvas, conf_thresh=0.0)\n",
-            "res_d_test = predict_single_scan(dnet_runner, test_canvas, conf_thresh=0.0)\n",
-            "print(f'Verification inference: HNet latency = {res_h_test[\"latency_ms\"]:.1f}ms ({len(res_h_test[\"boxes_xyxy\"])} raw proposals), '\n",
-            "      f'DNet latency = {res_d_test[\"latency_ms\"]:.1f}ms ({len(res_d_test[\"boxes_xyxy\"])} raw proposals).')\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 3: 3-Panel Side-by-Side Visualizer (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "def draw_bounding_boxes_on_axis(\n",
-            "    ax: plt.Axes,\n",
-            "    image_rgb: np.ndarray,\n",
-            "    boxes_xywh: List[List[float]],\n",
-            "    labels: List[int],\n",
-            "    scores: Optional[List[float]] = None,\n",
-            "    title: str = '',\n",
-            "    subtitle: str = ''\n",
-            "):\n",
-            "    \"\"\"\n",
-            "    Renders radiographic image with color-coded bounding boxes and banners.\n",
-            "    \"\"\"\n",
-            "    ax.imshow(image_rgb)\n",
-            "    ax.set_title(title, fontsize=12, fontweight='bold', pad=8)\n",
-            "    if subtitle:\n",
-            "        ax.text(0.5, -0.05, subtitle, transform=ax.transAxes, ha='center', fontsize=9, color='#555555')\n",
-            "    ax.axis('off')\n",
-            "    \n",
-            "    for i, (b, cat_id) in enumerate(zip(boxes_xywh, labels)):\n",
-            "        meta = CLASS_METADATA.get(int(cat_id), {'name': f'Class {cat_id}', 'color': '#FFFF00'})\n",
-            "        color = meta['color']\n",
-            "        name = meta['name']\n",
-            "        score_str = f' {scores[i]:.2f}' if scores is not None and i < len(scores) else ''\n",
-            "        x, y, w, h = b\n",
-            "        \n",
-            "        # Bounding box rectangle\n",
-            "        rect = patches.Rectangle(\n",
-            "            (x, y), w, h,\n",
-            "            linewidth=2.4,\n",
-            "            edgecolor=color,\n",
-            "            facecolor='none',\n",
-            "            linestyle='-'\n",
-            "        )\n",
-            "        ax.add_patch(rect)\n",
-            "        \n",
-            "        # Pathology label badge\n",
-            "        ax.text(\n",
-            "            x, max(0.0, y - 5.0),\n",
-            "            f'{name}{score_str}',\n",
-            "            color='white',\n",
-            "            fontsize=8.5,\n",
-            "            fontweight='bold',\n",
-            "            bbox=dict(boxstyle='square,pad=0.25', facecolor=color, alpha=0.9, edgecolor='none')\n",
-            "        )\n",
-            "\n",
-            "def visualize_3panel_comparison(\n",
-            "    image_rgb: np.ndarray,\n",
-            "    gt_boxes_xywh: List[List[float]],\n",
-            "    gt_labels: List[int],\n",
-            "    hnet_result: Dict[str, Any],\n",
-            "    dnet_result: Dict[str, Any],\n",
-            "    scan_title: str = 'Panoramic Dental Radiograph',\n",
-            "    conf_thresh: float = 0.30,\n",
-            "    figsize: Tuple[int, int] = (22, 7)\n",
-            ") -> Tuple[plt.Figure, Any]:\n",
-            "    \"\"\"\n",
-            "    Constructs a 3-panel comparative diagnostic figure:\n",
-            "    Ground Truth | HierarchicalNet | DiffusionNet\n",
-            "    \"\"\"\n",
-            "    fig, axes = plt.subplots(1, 3, figsize=figsize)\n",
-            "    \n",
-            "    # Filter model predictions by confidence threshold\n",
-            "    h_keep = [i for i, s in enumerate(hnet_result['scores']) if s >= conf_thresh]\n",
-            "    h_boxes = [hnet_result['boxes_xywh'][i] for i in h_keep]\n",
-            "    h_labels = [hnet_result['labels'][i] for i in h_keep]\n",
-            "    h_scores = [hnet_result['scores'][i] for i in h_keep]\n",
-            "    \n",
-            "    d_keep = [i for i, s in enumerate(dnet_result['scores']) if s >= conf_thresh]\n",
-            "    d_boxes = [dnet_result['boxes_xywh'][i] for i in d_keep]\n",
-            "    d_labels = [dnet_result['labels'][i] for i in d_keep]\n",
-            "    d_scores = [dnet_result['scores'][i] for i in d_keep]\n",
-            "    \n",
-            "    # Panel 1: Ground Truth Annotations\n",
-            "    draw_bounding_boxes_on_axis(\n",
-            "        axes[0], image_rgb, gt_boxes_xywh, gt_labels,\n",
-            "        title=f'Ground Truth Reference ({len(gt_boxes_xywh)} lesions)',\n",
-            "        subtitle='Clinical Expert Consensus Annotations'\n",
-            "    )\n",
-            "    \n",
-            "    # Panel 2: HierarchicalNet Predictions\n",
-            "    draw_bounding_boxes_on_axis(\n",
-            "        axes[1], image_rgb, h_boxes, h_labels, h_scores,\n",
-            "        title=f'HierarchicalNet ({len(h_boxes)} detections, conf \\u2265 {conf_thresh:.2f})',\n",
-            "        subtitle=f'FPN Multi-Scale Pyramids | Latency: {hnet_result[\"latency_ms\"]:.1f}ms'\n",
-            "    )\n",
-            "    \n",
-            "    # Panel 3: DiffusionNet Predictions\n",
-            "    draw_bounding_boxes_on_axis(\n",
-            "        axes[2], image_rgb, d_boxes, d_labels, d_scores,\n",
-            "        title=f'DiffusionNet ({len(d_boxes)} detections, conf \\u2265 {conf_thresh:.2f})',\n",
-            "        subtitle=f'Generative Reverse Diffusion | Latency: {dnet_result[\"latency_ms\"]:.1f}ms'\n",
-            "    )\n",
-            "    \n",
-            "    # Shared legend banner\n",
-            "    legend_patches = [\n",
-            "        patches.Patch(facecolor=CLASS_METADATA[cid]['color'], label=f'Class {cid}: {CLASS_METADATA[cid][\"name\"]}')\n",
-            "        for cid in sorted(CLASS_METADATA.keys())\n",
-            "    ]\n",
-            "    fig.legend(\n",
-            "        handles=legend_patches,\n",
-            "        loc='lower center',\n",
-            "        ncol=4,\n",
-            "        fontsize=10.5,\n",
-            "        frameon=True,\n",
-            "        facecolor='#FDFDFD',\n",
-            "        edgecolor='#CCCCCC',\n",
-            "        bbox_to_anchor=(0.5, -0.02)\n",
-            "    )\n",
-            "    \n",
-            "    fig.suptitle(scan_title, fontsize=14, fontweight='bold', y=0.98)\n",
-            "    plt.tight_layout(rect=[0, 0.05, 1, 0.95])\n",
-            "    return fig, axes\n",
-            "\n",
-            "print('3-panel diagnostic visualizer loaded successfully.')\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 4: Interactive Random & Specific Image Sampler (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "def box_iou(box1: List[float], box2: List[float]) -> float:\n",
-            "    \"\"\"\n",
-            "    Calculates Intersection over Union (IoU) between two xyxy boxes [x1, y1, x2, y2].\n",
-            "    \"\"\"\n",
-            "    x1 = max(box1[0], box2[0])\n",
-            "    y1 = max(box1[1], box2[1])\n",
-            "    x2 = min(box1[2], box2[2])\n",
-            "    y2 = min(box1[3], box2[3])\n",
-            "    \n",
-            "    inter_w = max(0.0, x2 - x1)\n",
-            "    inter_h = max(0.0, y2 - y1)\n",
-            "    inter_area = inter_w * inter_h\n",
-            "    \n",
-            "    area1 = max(0.0, box1[2] - box1[0]) * max(0.0, box1[3] - box1[1])\n",
-            "    area2 = max(0.0, box2[2] - box2[0]) * max(0.0, box2[3] - box2[1])\n",
-            "    union_area = area1 + area2 - inter_area\n",
-            "    \n",
-            "    return inter_area / union_area if union_area > 0 else 0.0\n",
-            "\n",
-            "def evaluate_scan_predictions(\n",
-            "    gt_boxes_xywh: List[List[float]],\n",
-            "    gt_labels: List[int],\n",
-            "    pred_boxes_xyxy: List[List[float]],\n",
-            "    pred_labels: List[int],\n",
-            "    pred_scores: List[float],\n",
-            "    iou_thresh: float = 0.50\n",
-            ") -> Dict[str, Any]:\n",
-            "    \"\"\"\n",
-            "    Performs greedy bipartite matching between predictions and ground truth boxes.\n",
-            "    Returns TP, FP, FN counts, precision, recall, and matched pairing metadata.\n",
-            "    \"\"\"\n",
-            "    gt_xyxy = [[b[0], b[1], b[0] + b[2], b[1] + b[3]] for b in gt_boxes_xywh]\n",
-            "    matched_gt = set()\n",
-            "    tp, fp = 0, 0\n",
-            "    matches = []\n",
-            "    \n",
-            "    # Sort predictions descending by confidence\n",
-            "    indices = sorted(range(len(pred_scores)), key=lambda k: pred_scores[k], reverse=True)\n",
-            "    \n",
-            "    for idx in indices:\n",
-            "        p_box = pred_boxes_xyxy[idx]\n",
-            "        p_label = pred_labels[idx]\n",
-            "        p_score = pred_scores[idx]\n",
-            "        \n",
-            "        best_iou = 0.0\n",
-            "        best_gt_idx = -1\n",
-            "        for g_idx, g_box in enumerate(gt_xyxy):\n",
-            "            if g_idx in matched_gt:\n",
-            "                continue\n",
-            "            iou = box_iou(p_box, g_box)\n",
-            "            if iou > best_iou:\n",
-            "                best_iou = iou\n",
-            "                best_gt_idx = g_idx\n",
-            "                \n",
-            "        if best_gt_idx >= 0 and best_iou >= iou_thresh:\n",
-            "            g_label = gt_labels[best_gt_idx]\n",
-            "            if p_label == g_label:\n",
-            "                tp += 1\n",
-            "                matched_gt.add(best_gt_idx)\n",
-            "                matches.append({\n",
-            "                    'type': 'TP',\n",
-            "                    'pred_label': p_label,\n",
-            "                    'gt_label': g_label,\n",
-            "                    'iou': best_iou,\n",
-            "                    'score': p_score\n",
-            "                })\n",
-            "            else:\n",
-            "                fp += 1\n",
-            "                matches.append({\n",
-            "                    'type': 'ClsErr',\n",
-            "                    'pred_label': p_label,\n",
-            "                    'gt_label': g_label,\n",
-            "                    'iou': best_iou,\n",
-            "                    'score': p_score\n",
-            "                })\n",
-            "        else:\n",
-            "            fp += 1\n",
-            "            matches.append({\n",
-            "                'type': 'BkgFP' if best_iou < 0.10 else 'LocErr',\n",
-            "                'pred_label': p_label,\n",
-            "                'gt_label': gt_labels[best_gt_idx] if best_gt_idx >= 0 else None,\n",
-            "                'iou': best_iou,\n",
-            "                'score': p_score\n",
-            "            })\n",
-            "            \n",
-            "    fn = len(gt_xyxy) - len(matched_gt)\n",
-            "    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0\n",
-            "    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0\n",
-            "    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0\n",
-            "    \n",
-            "    return {\n",
-            "        'tp': tp,\n",
-            "        'fp': fp,\n",
-            "        'fn': fn,\n",
-            "        'precision': precision,\n",
-            "        'recall': recall,\n",
-            "        'f1': f1,\n",
-            "        'matches': matches,\n",
-            "        'matched_gt_indices': matched_gt\n",
-            "    }\n",
-            "\n",
-            "def sample_and_evaluate(\n",
-            "    image_id: Optional[int] = None,\n",
-            "    conf_thresh: float = 0.30,\n",
-            "    iou_thresh: float = 0.50,\n",
-            "    show_plot: bool = True\n",
-            ") -> Dict[str, Any]:\n",
-            "    \"\"\"\n",
-            "    Samples a validation scan (random or by ID), runs both models, and outputs comparison.\n",
-            "    \"\"\"\n",
-            "    if not val_images_dict:\n",
-            "        print('No validation images registered.')\n",
-            "        return {}\n",
-            "        \n",
-            "    if image_id is None or image_id not in val_images_dict:\n",
-            "        image_id = random.choice(list(val_images_dict.keys()))\n",
-            "        \n",
-            "    img_meta = val_images_dict[image_id]\n",
-            "    file_name = img_meta.get('file_name', f'scan_{image_id}.png')\n",
-            "    h, w = img_meta.get('height', 500), img_meta.get('width', 1000)\n",
-            "    rgb, bgr, img_path = load_scan_image(file_name, fallback_h=h, fallback_w=w)\n",
-            "    \n",
-            "    anns = val_annotations_by_img[image_id]\n",
-            "    gt_boxes = [a['bbox'] for a in anns]\n",
-            "    gt_labels = [a['category_id'] for a in anns]\n",
-            "    \n",
-            "    # Run inference for both models\n",
-            "    h_res = predict_single_scan(hnet_runner, bgr, conf_thresh=0.0)\n",
-            "    d_res = predict_single_scan(dnet_runner, bgr, conf_thresh=0.0)\n",
-            "    \n",
-            "    # Filter by conf_thresh for evaluation\n",
-            "    h_keep = [i for i, s in enumerate(h_res['scores']) if s >= conf_thresh]\n",
-            "    h_boxes_xyxy = [h_res['boxes_xyxy'][i] for i in h_keep]\n",
-            "    h_labels = [h_res['labels'][i] for i in h_keep]\n",
-            "    h_scores = [h_res['scores'][i] for i in h_keep]\n",
-            "    \n",
-            "    d_keep = [i for i, s in enumerate(d_res['scores']) if s >= conf_thresh]\n",
-            "    d_boxes_xyxy = [d_res['boxes_xyxy'][i] for i in d_keep]\n",
-            "    d_labels = [d_res['labels'][i] for i in d_keep]\n",
-            "    d_scores = [d_res['scores'][i] for i in d_keep]\n",
-            "    \n",
-            "    h_eval = evaluate_scan_predictions(gt_boxes, gt_labels, h_boxes_xyxy, h_labels, h_scores, iou_thresh=iou_thresh)\n",
-            "    d_eval = evaluate_scan_predictions(gt_boxes, gt_labels, d_boxes_xyxy, d_labels, d_scores, iou_thresh=iou_thresh)\n",
-            "    \n",
-            "    print(f'=== Image ID: {image_id} ({file_name}) | Dimensions: {rgb.shape[1]}x{rgb.shape[0]} | GT Lesions: {len(gt_boxes)} ===')\n",
-            "    print(f'  HierarchicalNet -> Preds: {len(h_keep)}, TP: {h_eval[\"tp\"]}, FP: {h_eval[\"fp\"]}, FN: {h_eval[\"fn\"]} | '\n",
-            "          f'Prec: {h_eval[\"precision\"]:.2f}, Rec: {h_eval[\"recall\"]:.2f}, F1: {h_eval[\"f1\"]:.2f} (Latency: {h_res[\"latency_ms\"]:.1f}ms)')\n",
-            "    print(f'  DiffusionNet    -> Preds: {len(d_keep)}, TP: {d_eval[\"tp\"]}, FP: {d_eval[\"fp\"]}, FN: {d_eval[\"fn\"]} | '\n",
-            "          f'Prec: {d_eval[\"precision\"]:.2f}, Rec: {d_eval[\"recall\"]:.2f}, F1: {d_eval[\"f1\"]:.2f} (Latency: {d_res[\"latency_ms\"]:.1f}ms)')\n",
-            "          \n",
-            "    if show_plot:\n",
-            "        fig, _ = visualize_3panel_comparison(\n",
-            "            rgb, gt_boxes, gt_labels, h_res, d_res,\n",
-            "            scan_title=f'Scan {image_id} ({file_name}) — Ground Truth vs HierarchicalNet vs DiffusionNet',\n",
-            "            conf_thresh=conf_thresh\n",
-            "        )\n",
-            "        plt.show()\n",
-            "        \n",
-            "    return {\n",
-            "        'image_id': image_id,\n",
-            "        'gt_count': len(gt_boxes),\n",
-            "        'hnet_eval': h_eval,\n",
-            "        'dnet_eval': d_eval,\n",
-            "        'hnet_latency': h_res['latency_ms'],\n",
-            "        'dnet_latency': d_res['latency_ms']\n",
-            "    }\n",
-            "\n",
-            "# Run interactive demonstration on first validation scan\n",
-            "first_id = list(val_images_dict.keys())[0] if val_images_dict else None\n",
-            "sample_res = sample_and_evaluate(image_id=first_id, conf_thresh=0.30, iou_thresh=0.50)\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 5: Quantitative Error Breakdown & 4x5 Confusion Matrix (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "# Comprehensive evaluation across all validation scans\n",
-            "EVAL_CONF_THRESH = 0.30\n",
-            "EVAL_IOU_THRESH = 0.50\n",
-            "\n",
-            "# TIDE / COCO Error taxonomy buckets:\n",
-            "# - Cls: Correct localization (IoU >= 0.5), wrong class\n",
-            "# - Loc: Correct class, poor localization (0.1 <= IoU < 0.5)\n",
-            "# - Bkg: Background False Positive (IoU < 0.1)\n",
-            "# - Missed: False Negative (GT not matched with IoU >= 0.5)\n",
-            "# - Dup: Duplicate detection of already matched GT\n",
-            "\n",
-            "def run_full_cohort_error_analysis(conf_thresh: float = 0.30, iou_thresh: float = 0.50):\n",
-            "    models = {\n",
-            "        'HierarchicalNet': hnet_runner,\n",
-            "        'DiffusionNet': dnet_runner\n",
-            "    }\n",
-            "    \n",
-            "    error_breakdown = {\n",
-            "        m_name: {'TP': 0, 'Cls': 0, 'Loc': 0, 'Bkg': 0, 'Dup': 0, 'Missed': 0}\n",
-            "        for m_name in models\n",
-            "    }\n",
-            "    \n",
-            "    # 4 classes + 1 background column = 4 x 5 confusion matrix\n",
-            "    # Rows: Ground Truth Class (1..4)\n",
-            "    # Cols: Predicted Class (1..4) + Background/Missed (col 4, index 4)\n",
-            "    confusion_matrices = {\n",
-            "        m_name: np.zeros((4, 5), dtype=int)\n",
-            "        for m_name in models\n",
-            "    }\n",
-            "    \n",
-            "    matched_records = {m_name: [] for m_name in models}\n",
-            "    \n",
-            "    total_gt = sum(len(anns) for anns in val_annotations_by_img.values())\n",
-            "    print(f'Initiating full validation cohort evaluation ({len(val_images_dict)} scans, {total_gt} GT lesions)...')\n",
-            "    \n",
-            "    for img_id, img_meta in val_images_dict.items():\n",
-            "        file_name = img_meta.get('file_name', f'scan_{img_id}.png')\n",
-            "        h, w = img_meta.get('height', 500), img_meta.get('width', 1000)\n",
-            "        rgb, bgr, img_path = load_scan_image(file_name, fallback_h=h, fallback_w=w)\n",
-            "        \n",
-            "        anns = val_annotations_by_img[img_id]\n",
-            "        gt_boxes_xywh = [a['bbox'] for a in anns]\n",
-            "        gt_xyxy = [[b[0], b[1], b[0] + b[2], b[1] + b[3]] for b in gt_boxes_xywh]\n",
-            "        gt_labels = [a['category_id'] for a in anns]\n",
-            "        gt_areas = [a.get('area', b[2] * b[3]) for a, b in zip(anns, gt_boxes_xywh)]\n",
-            "        \n",
-            "        for m_name, runner in models.items():\n",
-            "            res = predict_single_scan(runner, bgr, conf_thresh=conf_thresh)\n",
-            "            p_boxes = res['boxes_xyxy']\n",
-            "            p_labels = res['labels']\n",
-            "            p_scores = res['scores']\n",
-            "            \n",
-            "            matched_gt = set()\n",
-            "            pred_matched_to_gt = {}\n",
-            "            \n",
-            "            # Sort predictions descending by score\n",
-            "            sorted_p_indices = sorted(range(len(p_scores)), key=lambda k: p_scores[k], reverse=True)\n",
-            "            \n",
-            "            for p_idx in sorted_p_indices:\n",
-            "                pb = p_boxes[p_idx]\n",
-            "                pl = p_labels[p_idx]\n",
-            "                ps = p_scores[p_idx]\n",
-            "                \n",
-            "                best_iou = 0.0\n",
-            "                best_gt_idx = -1\n",
-            "                for g_idx, gb in enumerate(gt_xyxy):\n",
-            "                    iou = box_iou(pb, gb)\n",
-            "                    if iou > best_iou:\n",
-            "                        best_iou = iou\n",
-            "                        best_gt_idx = g_idx\n",
-            "                        \n",
-            "                if best_gt_idx >= 0 and best_iou >= iou_thresh:\n",
-            "                    gl = gt_labels[best_gt_idx]\n",
-            "                    if best_gt_idx not in matched_gt:\n",
-            "                        if pl == gl:\n",
-            "                            error_breakdown[m_name]['TP'] += 1\n",
-            "                            confusion_matrices[m_name][gl - 1, pl - 1] += 1\n",
-            "                            matched_gt.add(best_gt_idx)\n",
-            "                            matched_records[m_name].append({\n",
-            "                                'type': 'TP', 'class': pl, 'score': ps, 'iou': best_iou,\n",
-            "                                'area': gt_areas[best_gt_idx], 'w': pb[2] - pb[0], 'h': pb[3] - pb[1]\n",
-            "                            })\n",
-            "                        else:\n",
-            "                            error_breakdown[m_name]['Cls'] += 1\n",
-            "                            confusion_matrices[m_name][gl - 1, pl - 1] += 1\n",
-            "                            matched_gt.add(best_gt_idx)\n",
-            "                            matched_records[m_name].append({\n",
-            "                                'type': 'Cls', 'gt_class': gl, 'pred_class': pl, 'score': ps, 'iou': best_iou,\n",
-            "                                'area': gt_areas[best_gt_idx], 'w': pb[2] - pb[0], 'h': pb[3] - pb[1]\n",
-            "                            })\n",
-            "                    else:\n",
-            "                        error_breakdown[m_name]['Dup'] += 1\n",
-            "                        matched_records[m_name].append({\n",
-            "                            'type': 'Dup', 'class': pl, 'score': ps, 'iou': best_iou,\n",
-            "                            'area': gt_areas[best_gt_idx], 'w': pb[2] - pb[0], 'h': pb[3] - pb[1]\n",
-            "                        })\n",
-            "                elif best_gt_idx >= 0 and best_iou >= 0.10:\n",
-            "                    error_breakdown[m_name]['Loc'] += 1\n",
-            "                    matched_records[m_name].append({\n",
-            "                        'type': 'Loc', 'pred_class': pl, 'score': ps, 'iou': best_iou,\n",
-            "                        'area': gt_areas[best_gt_idx], 'w': pb[2] - pb[0], 'h': pb[3] - pb[1]\n",
-            "                    })\n",
-            "                else:\n",
-            "                    error_breakdown[m_name]['Bkg'] += 1\n",
-            "                    matched_records[m_name].append({\n",
-            "                        'type': 'Bkg', 'pred_class': pl, 'score': ps, 'iou': best_iou,\n",
-            "                        'area': (pb[2] - pb[0]) * (pb[3] - pb[1]), 'w': pb[2] - pb[0], 'h': pb[3] - pb[1]\n",
-            "                    })\n",
-            "                    \n",
-            "            # Record Missed ground truths (False Negatives)\n",
-            "            for g_idx in range(len(gt_xyxy)):\n",
-            "                if g_idx not in matched_gt:\n",
-            "                    error_breakdown[m_name]['Missed'] += 1\n",
-            "                    gl = gt_labels[g_idx]\n",
-            "                    # Col 4 is the Background / Missed column\n",
-            "                    confusion_matrices[m_name][gl - 1, 4] += 1\n",
-            "                    matched_records[m_name].append({\n",
-            "                        'type': 'Missed', 'class': gl, 'area': gt_areas[g_idx]\n",
-            "                    })\n",
-            "                    \n",
-            "    return error_breakdown, confusion_matrices, matched_records\n",
-            "\n",
-            "error_stats, conf_mats, detailed_records = run_full_cohort_error_analysis(conf_thresh=EVAL_CONF_THRESH, iou_thresh=EVAL_IOU_THRESH)\n",
-            "\n",
-            "# Visual Plot 1: TIDE Quantitative Error Decomposition\n",
-            "fig, ax = plt.subplots(figsize=(12, 5))\n",
-            "categories = ['Classification\\nError (Cls)', 'Localization\\nError (Loc)', 'Background FP\\n(Bkg)', 'Missed GT\\n(Missed FN)', 'Duplicate\\nDetection (Dup)']\n",
-            "h_vals = [error_stats['HierarchicalNet'][k] for k in ['Cls', 'Loc', 'Bkg', 'Missed', 'Dup']]\n",
-            "d_vals = [error_stats['DiffusionNet'][k] for k in ['Cls', 'Loc', 'Bkg', 'Missed', 'Dup']]\n",
-            "\n",
-            "x = np.arange(len(categories))\n",
-            "bar_w = 0.35\n",
-            "rects1 = ax.bar(x - bar_w/2, h_vals, bar_w, label='HierarchicalNet', color='#4C72B0', edgecolor='#222222', alpha=0.9)\n",
-            "rects2 = ax.bar(x + bar_w/2, d_vals, bar_w, label='DiffusionNet', color='#55A868', edgecolor='#222222', alpha=0.9)\n",
-            "\n",
-            "ax.set_ylabel('Total Error Occurrence Count', fontsize=11, fontweight='bold')\n",
-            "ax.set_title('TIDE Quantitative Error Taxonomy: HierarchicalNet vs DiffusionNet', fontsize=13, fontweight='bold', pad=12)\n",
-            "ax.set_xticks(x)\n",
-            "ax.set_xticklabels(categories, fontsize=10)\n",
-            "ax.legend(fontsize=10.5, frameon=True)\n",
-            "\n",
-            "for r in rects1 + rects2:\n",
-            "    h = r.get_height()\n",
-            "    if h > 0:\n",
-            "        ax.annotate(f'{int(h)}', xy=(r.get_x() + r.get_width() / 2, h),\n",
-            "                    xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9.5, fontweight='bold')\n",
-            "\n",
-            "plt.tight_layout()\n",
-            "plt.show()\n",
-            "\n",
-            "# Visual Plot 2: 4x5 Confusion Matrix Heatmaps (HierarchicalNet vs DiffusionNet)\n",
-            "fig, axes = plt.subplots(1, 2, figsize=(18, 7))\n",
-            "col_names = CLASS_NAMES + ['Background / Missed']\n",
-            "\n",
-            "for idx, (m_name, cm) in enumerate(conf_mats.items()):\n",
-            "    # Row-normalized matrix (percentages per GT class)\n",
-            "    row_sums = cm.sum(axis=1, keepdims=True)\n",
-            "    cm_norm = np.divide(cm.astype(float), row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0) * 100.0\n",
-            "    \n",
-            "    annot_matrix = np.empty(cm.shape, dtype=object)\n",
-            "    for r in range(cm.shape[0]):\n",
-            "        for c in range(cm.shape[1]):\n",
-            "            annot_matrix[r, c] = f'{cm[r, c]}\\n({cm_norm[r, c]:.1f}%)'\n",
-            "            \n",
-            "    sns.heatmap(\n",
-            "        cm_norm, annot=annot_matrix, fmt='', cmap='Blues' if idx == 0 else 'Greens',\n",
-            "        ax=axes[idx], cbar=True, vmin=0, vmax=100,\n",
-            "        xticklabels=col_names, yticklabels=CLASS_NAMES,\n",
-            "        linewidths=0.6, linecolor='#DDDDDD'\n",
-            "    )\n",
-            "    axes[idx].set_title(f'Confusion Matrix: {m_name}\\n(Counts & Row-Normalized %)', fontsize=12, fontweight='bold', pad=10)\n",
-            "    axes[idx].set_xlabel('Predicted Class', fontsize=11, fontweight='bold')\n",
-            "    axes[idx].set_ylabel('Ground Truth Class', fontsize=11, fontweight='bold')\n",
-            "    axes[idx].tick_params(axis='x', rotation=25)\n",
-            "\n",
-            "plt.suptitle('4 \\u00d7 5 Pathology Detection Confusion Matrices (Including Missed / Background)', fontsize=14, fontweight='bold', y=0.98)\n",
-            "plt.tight_layout(rect=[0, 0, 1, 0.95])\n",
-            "plt.show()\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 6: Success Profiling: Characteristics of Correct Detections (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "# Success Profiling: Characteristics of True Positive detections\n",
-            "# Analyzes bounding box scale (COCO Small, Medium, Large), aspect ratio, confidence calibration, and boundary sharpness\n",
-            "\n",
-            "fig, axes = plt.subplots(2, 2, figsize=(16, 12))\n",
-            "\n",
-            "# 1. Success Rate across COCO Scales (< 32^2, 32^2 - 96^2, >= 96^2)\n",
-            "scale_labels = ['Small (<32\\u00b2)', 'Medium (32\\u00b2\\u201396\\u00b2)', 'Large (\\u226596\\u00b2)']\n",
-            "scale_bounds = [0, 32**2, 96**2, float('inf')]\n",
-            "\n",
-            "h_scale_tp = [0, 0, 0]\n",
-            "h_scale_total = [0, 0, 0]\n",
-            "d_scale_tp = [0, 0, 0]\n",
-            "d_scale_total = [0, 0, 0]\n",
-            "\n",
-            "for rec in detailed_records['HierarchicalNet']:\n",
-            "    area = rec.get('area', 0)\n",
-            "    for s_idx in range(3):\n",
-            "        if scale_bounds[s_idx] <= area < scale_bounds[s_idx + 1]:\n",
-            "            if rec['type'] == 'TP':\n",
-            "                h_scale_tp[s_idx] += 1\n",
-            "                h_scale_total[s_idx] += 1\n",
-            "            elif rec['type'] in ['Missed', 'Cls', 'Loc']:\n",
-            "                h_scale_total[s_idx] += 1\n",
-            "\n",
-            "for rec in detailed_records['DiffusionNet']:\n",
-            "    area = rec.get('area', 0)\n",
-            "    for s_idx in range(3):\n",
-            "        if scale_bounds[s_idx] <= area < scale_bounds[s_idx + 1]:\n",
-            "            if rec['type'] == 'TP':\n",
-            "                d_scale_tp[s_idx] += 1\n",
-            "                d_scale_total[s_idx] += 1\n",
-            "            elif rec['type'] in ['Missed', 'Cls', 'Loc']:\n",
-            "                d_scale_total[s_idx] += 1\n",
-            "\n",
-            "h_recall_by_scale = [(h_scale_tp[i] / h_scale_total[i] * 100.0) if h_scale_total[i] > 0 else 0.0 for i in range(3)]\n",
-            "d_recall_by_scale = [(d_scale_tp[i] / d_scale_total[i] * 100.0) if d_scale_total[i] > 0 else 0.0 for i in range(3)]\n",
-            "\n",
-            "x_s = np.arange(len(scale_labels))\n",
-            "bw = 0.35\n",
-            "axes[0, 0].bar(x_s - bw/2, h_recall_by_scale, bw, label='HierarchicalNet', color='#4C72B0', edgecolor='#333333')\n",
-            "axes[0, 0].bar(x_s + bw/2, d_recall_by_scale, bw, label='DiffusionNet', color='#55A868', edgecolor='#333333')\n",
-            "axes[0, 0].set_ylabel('Detection Sensitivity / Recall (%)', fontsize=10.5, fontweight='bold')\n",
-            "axes[0, 0].set_title('A: Detection Sensitivity by Pathology Scale (COCO Taxonomy)', fontsize=11.5, fontweight='bold')\n",
-            "axes[0, 0].set_xticks(x_s)\n",
-            "axes[0, 0].set_xticklabels(scale_labels, fontsize=10)\n",
-            "axes[0, 0].set_ylim(0, 105)\n",
-            "axes[0, 0].legend(fontsize=9.5)\n",
-            "\n",
-            "# 2. Confidence Calibration: Score Distribution (True Positives vs False Positives)\n",
-            "h_tp_scores = [r['score'] for r in detailed_records['HierarchicalNet'] if r['type'] == 'TP' and 'score' in r]\n",
-            "h_fp_scores = [r['score'] for r in detailed_records['HierarchicalNet'] if r['type'] in ['Cls', 'Loc', 'Bkg'] and 'score' in r]\n",
-            "d_tp_scores = [r['score'] for r in detailed_records['DiffusionNet'] if r['type'] == 'TP' and 'score' in r]\n",
-            "d_fp_scores = [r['score'] for r in detailed_records['DiffusionNet'] if r['type'] in ['Cls', 'Loc', 'Bkg'] and 'score' in r]\n",
-            "\n",
-            "bins = np.linspace(0.2, 1.0, 17)\n",
-            "if h_tp_scores or h_fp_scores:\n",
-            "    axes[0, 1].hist(h_tp_scores, bins=bins, alpha=0.6, label=f'HierarchicalNet TP (n={len(h_tp_scores)})', color='#4C72B0', density=True)\n",
-            "    axes[0, 1].hist(h_fp_scores, bins=bins, alpha=0.4, label=f'HierarchicalNet FP (n={len(h_fp_scores)})', color='#C44E52', density=True)\n",
-            "if d_tp_scores:\n",
-            "    axes[0, 1].hist(d_tp_scores, bins=bins, alpha=0.5, label=f'DiffusionNet TP (n={len(d_tp_scores)})', color='#55A868', density=True, histtype='step', linewidth=2)\n",
-            "axes[0, 1].set_xlabel('Confidence Score', fontsize=10.5, fontweight='bold')\n",
-            "axes[0, 1].set_ylabel('Probability Density', fontsize=10.5, fontweight='bold')\n",
-            "axes[0, 1].set_title('B: Confidence Calibration Profile (True Positives vs False Positives)', fontsize=11.5, fontweight='bold')\n",
-            "axes[0, 1].legend(fontsize=9)\n",
-            "\n",
-            "# 3. Boundary Sharpness: Localization Precision (IoU distribution of Matched True Positives)\n",
-            "h_tp_ious = [r['iou'] for r in detailed_records['HierarchicalNet'] if r['type'] == 'TP' and 'iou' in r]\n",
-            "d_tp_ious = [r['iou'] for r in detailed_records['DiffusionNet'] if r['type'] == 'TP' and 'iou' in r]\n",
-            "\n",
-            "iou_bins = np.linspace(0.5, 1.0, 11)\n",
-            "if h_tp_ious:\n",
-            "    axes[1, 0].hist(h_tp_ious, bins=iou_bins, alpha=0.65, label=f'HierarchicalNet (Mean IoU: {np.mean(h_tp_ious):.2f})', color='#4C72B0')\n",
-            "if d_tp_ious:\n",
-            "    axes[1, 0].hist(d_tp_ious, bins=iou_bins, alpha=0.65, label=f'DiffusionNet (Mean IoU: {np.mean(d_tp_ious):.2f})', color='#55A868')\n",
-            "axes[1, 0].set_xlabel('Intersection over Union (IoU) on Matched Detections', fontsize=10.5, fontweight='bold')\n",
-            "axes[1, 0].set_ylabel('Number of Matched Lesions', fontsize=10.5, fontweight='bold')\n",
-            "axes[1, 0].set_title('C: Boundary Sharpness & Localization Tightness', fontsize=11.5, fontweight='bold')\n",
-            "axes[1, 0].legend(fontsize=9.5)\n",
-            "\n",
-            "# 4. Aspect Ratio Distribution (Width / Height) of Detections vs Ground Truth\n",
-            "tp_ratios_h = [r['w'] / max(1.0, r['h']) for r in detailed_records['HierarchicalNet'] if r['type'] == 'TP' and 'w' in r]\n",
-            "tp_ratios_d = [r['w'] / max(1.0, r['h']) for r in detailed_records['DiffusionNet'] if r['type'] == 'TP' and 'w' in r]\n",
-            "\n",
-            "ratio_bins = np.linspace(0.2, 3.0, 15)\n",
-            "if tp_ratios_h:\n",
-            "    axes[1, 1].hist(tp_ratios_h, bins=ratio_bins, alpha=0.6, label='HierarchicalNet TP Aspect Ratio', color='#4C72B0')\n",
-            "if tp_ratios_d:\n",
-            "    axes[1, 1].hist(tp_ratios_d, bins=ratio_bins, alpha=0.5, label='DiffusionNet TP Aspect Ratio', color='#55A868', histtype='step', linewidth=2)\n",
-            "axes[1, 1].axvline(1.0, color='#888888', linestyle='--', label='Square Aspect (1:1)')\n",
-            "axes[1, 1].set_xlabel('Aspect Ratio (Width / Height)', fontsize=10.5, fontweight='bold')\n",
-            "axes[1, 1].set_ylabel('Count', fontsize=10.5, fontweight='bold')\n",
-            "axes[1, 1].set_title('D: Lesion Aspect Ratio Distribution (Geometry Profiling)', fontsize=11.5, fontweight='bold')\n",
-            "axes[1, 1].legend(fontsize=9.5)\n",
-            "\n",
-            "plt.suptitle('Success Profiling: Geometric & Calibration Signatures of Successful Detections', fontsize=13.5, fontweight='bold', y=0.99)\n",
-            "plt.tight_layout(rect=[0, 0, 1, 0.96])\n",
-            "plt.show()\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 7: Deep Analysis of Top 5 Failure Modes with Case Galleries (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "# Deep Analysis of Top 5 Failure Modes in Dental AI Radiography\n",
-            "# Defines the clinical taxonomy, extracts/simulates exemplary diagnostic scenarios,\n",
-            "# and displays a publication case gallery with clinical notes.\n",
-            "\n",
-            "FAILURE_MODES = [\n",
-            "    {\n",
-            "        'mode_id': 1,\n",
-            "        'title': 'Mode 1: Caries vs Deep Caries Confusion',\n",
-            "        'sub': 'Enamel-Dentin Junction (EDJ) Penetration Ambiguity',\n",
-            "        'clinical_etiology': (\n",
-            "            'Projectional 2D compression of the complex 3D coronal tooth structure blurs the threshold between '\n",
-            "            'superficial dentin demineralization (Class 1) and deep dentinal penetration with pulpal proximity (Class 2). '\n",
-            "            'Without bitewing projection or 3D CBCT, pulpal wall thickness cannot be histologically confirmed.'\n",
-            "        ),\n",
-            "        'remedy': 'Implement multi-view bitewing radiograph integration and depth-calibrated threshold margins.'\n",
-            "    },\n",
-            "    {\n",
-            "        'mode_id': 2,\n",
-            "        'title': 'Mode 2: Missed Small / Early Lesions (<32\\u00b2 pixels)',\n",
-            "        'sub': 'Incipient Occlusal and Interproximal Enamel Demineralization',\n",
-            "        'clinical_etiology': (\n",
-            "            'Early carious lesions appear as faint, subtle radiolucencies restricted to enamel. Sensor noise, sensor saturation, '\n",
-            "            'and downsampling through spatial pooling layers cause feature loss in early lesions smaller than 32x32 pixels.'\n",
-            "        ),\n",
-            "        'remedy': 'High-resolution patch-based pyramid zooming and attention heads dedicated to high-frequency edge gradients.'\n",
-            "    },\n",
-            "    {\n",
-            "        'mode_id': 3,\n",
-            "        'title': 'Mode 3: Anatomical Pseudo-Lesions',\n",
-            "        'sub': 'Normal Radiolucent Anatomy Confused with Periapical Pathology',\n",
-            "        'clinical_etiology': (\n",
-            "            'Normal anatomical radiolucencies—such as the mental foramen, incisive canal, mandibular canal, and maxillary sinus recesses—'\n",
-            "            'frequently project near the root apices of premolars and incisors, mimicking apical rarefying osteitis (Class 3).'\n",
-            "        ),\n",
-            "        'remedy': 'Anatomical prior knowledge conditioning (dental arch coordinates) and lamina dura integrity verification.'\n",
-            "    },\n",
-            "    {\n",
-            "        'mode_id': 4,\n",
-            "        'title': 'Mode 4: Localization Jitter & Boundary Ambiguity',\n",
-            "        'sub': 'Diffuse Bone Rarefaction vs Ill-Defined Apical Cortical Borders',\n",
-            "        'clinical_etiology': (\n",
-            "            'Chronic periapical granulomas and condensing osteitis feature ill-defined, diffuse transitions into healthy cancellous bone. '\n",
-            "            'The lack of an abrupt cortical boundary leads to substantial bounding box coordinate variance (IoU 0.20-0.49).'\n",
-            "        ),\n",
-            "        'remedy': 'Generative diffusion refinement heads (DiffusionNet) with continuous boundary variance regression.'\n",
-            "    },\n",
-            "    {\n",
-            "        'mode_id': 5,\n",
-            "        'title': 'Mode 5: Dental Crowding & Restorative Artifacts',\n",
-            "        'sub': 'Overlapping Enamel, Cervical Burnout & Metallic Photon Starvation',\n",
-            "        'clinical_etiology': (\n",
-            "            'Severe crown overlap creates optical radiolucency (\"cervical burnout\"), while radiopaque metallic restorations '\n",
-            "            '(amalgams, gold crowns, implants) introduce severe photon starvation streak artifacts across the dental arch.'\n",
-            "        ),\n",
-            "        'remedy': 'Beam hardening artifact reduction preprocessing and occlusion-aware multi-instance clustering.'\n",
-            "    }\n",
-            "]\n",
-            "\n",
-            "print('=' * 80)\n",
-            "print('CLINICAL PROFILE: TOP 5 FAILURE MODES IN DENTAL RADIOGRAPH DETECTION')\n",
-            "print('=' * 80)\n",
-            "for m in FAILURE_MODES:\n",
-            "    print(f'\\n[Failure {m[\"title\"]}]')\n",
-            "    print(f'  Subtitle : {m[\"sub\"]}')\n",
-            "    print(f'  Etiology : {m[\"clinical_etiology\"]}')\n",
-            "    print(f'  Solution : {m[\"remedy\"]}')\n",
-            "\n",
-            "# Visual Case Gallery: Top 5 Failure Modes\n",
-            "fig, axes = plt.subplots(5, 3, figsize=(21, 24))\n",
-            "\n",
-            "for row_idx, mode in enumerate(FAILURE_MODES):\n",
-            "    m_id = mode['mode_id']\n",
-            "    \n",
-            "    # Generate synthetic exemplary patch representing the failure scenario\n",
-            "    patch_h, patch_w = 200, 360\n",
-            "    canvas = np.full((patch_h, patch_w, 3), 110, dtype=np.uint8)\n",
-            "    # Tooth root/crown gradient background\n",
-            "    for y in range(patch_h):\n",
-            "        val = int(80 + 50 * math.sin(math.pi * y / patch_h))\n",
-            "        canvas[y, :] = [val, val, val]\n",
-            "        \n",
-            "    if m_id == 1:\n",
-            "        # Coronal caries cavity\n",
-            "        cv2.circle(canvas, (180, 80), 28, (45, 45, 45), -1)\n",
-            "        gt_box = [150, 50, 60, 60]\n",
-            "        gt_cat = 2  # Ground Truth: Deep Caries\n",
-            "        # HNet predicts Class 1 (Caries)\n",
-            "        h_box = [152, 52, 56, 56]\n",
-            "        h_cat, h_score = 1, 0.82\n",
-            "        # DNet predicts Class 2 (Deep Caries)\n",
-            "        d_box = [149, 49, 62, 62]\n",
-            "        d_cat, d_score = 2, 0.87\n",
-            "    elif m_id == 2:\n",
-            "        # Tiny incipient interproximal caries (< 24 px)\n",
-            "        cv2.circle(canvas, (160, 95), 8, (60, 60, 60), -1)\n",
-            "        gt_box = [152, 87, 16, 16]\n",
-            "        gt_cat = 1  # Caries\n",
-            "        # HNet misses (FN)\n",
-            "        h_box, h_cat, h_score = None, None, None\n",
-            "        # DNet detects with lower score\n",
-            "        d_box = [150, 85, 20, 20]\n",
-            "        d_cat, d_score = 1, 0.48\n",
-            "    elif m_id == 3:\n",
-            "        # Normal mental foramen radiolucency mistaken for periapical lesion\n",
-            "        cv2.ellipse(canvas, (180, 130), (22, 14), 0, 0, 360, (55, 55, 55), -1)\n",
-            "        gt_box, gt_cat = None, None  # Normal anatomy: No Ground Truth lesion!\n",
-            "        # HNet false positive on mental foramen\n",
-            "        h_box = [155, 114, 50, 32]\n",
-            "        h_cat, h_score = 3, 0.69  # False positive Periapical Lesion\n",
-            "        # DNet correctly suppresses\n",
-            "        d_box, d_cat, d_score = None, None, None\n",
-            "    elif m_id == 4:\n",
-            "        # Diffuse periapical rarefaction osteitis with ill-defined margin\n",
-            "        for r in range(35, 10, -5):\n",
-            "            cv2.circle(canvas, (180, 140), r, (int(60 + r * 1.5), int(60 + r * 1.5), int(60 + r * 1.5)), -1)\n",
-            "        gt_box = [145, 105, 70, 70]\n",
-            "        gt_cat = 3  # Periapical Lesion\n",
-            "        # HNet suffers localization jitter (under-segmented, IoU ~0.38)\n",
-            "        h_box = [160, 120, 42, 40]\n",
-            "        h_cat, h_score = 3, 0.74\n",
-            "        # DNet achieves tight diffusion boundary (IoU ~0.76)\n",
-            "        d_box = [146, 106, 68, 68]\n",
-            "        d_cat, d_score = 3, 0.81\n",
-            "    else:\n",
-            "        # Crowded impacted molar with radiopaque metallic crown artifact\n",
-            "        cv2.rectangle(canvas, (70, 30), (140, 100), (250, 250, 250), -1)  # Metallic crown\n",
-            "        cv2.ellipse(canvas, (240, 110), (45, 30), 45, 0, 360, (180, 180, 180), -1)  # Impacted molar\n",
-            "        gt_box = [195, 75, 90, 70]\n",
-            "        gt_cat = 4  # Impacted Tooth\n",
-            "        # HNet has artifact streak false positive\n",
-            "        h_box = [190, 70, 100, 80]\n",
-            "        h_cat, h_score = 4, 0.61\n",
-            "        # DNet accurately isolates the tooth boundary\n",
-            "        d_box = [194, 74, 92, 72]\n",
-            "        d_cat, d_score = 4, 0.86\n",
-            "        \n",
-            "    # Panel 1: Ground Truth Reference\n",
-            "    axes[row_idx, 0].imshow(canvas)\n",
-            "    if gt_box and gt_cat:\n",
-            "        col = CLASS_METADATA[gt_cat]['color']\n",
-            "        nm = CLASS_METADATA[gt_cat]['name']\n",
-            "        rect = patches.Rectangle((gt_box[0], gt_box[1]), gt_box[2], gt_box[3], linewidth=2.5, edgecolor=col, facecolor='none')\n",
-            "        axes[row_idx, 0].add_patch(rect)\n",
-            "        axes[row_idx, 0].text(gt_box[0], max(0, gt_box[1] - 4), f'GT: {nm}', color='white', fontsize=8.5, fontweight='bold',\n",
-            "                              bbox=dict(boxstyle='square,pad=0.2', facecolor=col, alpha=0.9, edgecolor='none'))\n",
-            "        axes[row_idx, 0].set_title(f'{mode[\"title\"]}\\nGround Truth Reference: {nm}', fontsize=10.5, fontweight='bold')\n",
-            "    else:\n",
-            "        axes[row_idx, 0].set_title(f'{mode[\"title\"]}\\nGround Truth: Normal Anatomy (No Lesion)', fontsize=10.5, fontweight='bold')\n",
-            "    axes[row_idx, 0].axis('off')\n",
-            "    \n",
-            "    # Panel 2: HierarchicalNet Prediction\n",
-            "    axes[row_idx, 1].imshow(canvas)\n",
-            "    if h_box and h_cat:\n",
-            "        col = CLASS_METADATA[h_cat]['color']\n",
-            "        nm = CLASS_METADATA[h_cat]['name']\n",
-            "        rect = patches.Rectangle((h_box[0], h_box[1]), h_box[2], h_box[3], linewidth=2.5, edgecolor=col, facecolor='none')\n",
-            "        axes[row_idx, 1].add_patch(rect)\n",
-            "        axes[row_idx, 1].text(h_box[0], max(0, h_box[1] - 4), f'{nm} ({h_score:.2f})', color='white', fontsize=8.5, fontweight='bold',\n",
-            "                              bbox=dict(boxstyle='square,pad=0.2', facecolor=col, alpha=0.9, edgecolor='none'))\n",
-            "        axes[row_idx, 1].set_title(f'HierarchicalNet Prediction: {nm} ({h_score:.2f})', fontsize=10.5, fontweight='bold')\n",
-            "    else:\n",
-            "        axes[row_idx, 1].set_title('HierarchicalNet: Missed / No Detection (FN)', fontsize=10.5, fontweight='bold', color='#C44E52')\n",
-            "    axes[row_idx, 1].axis('off')\n",
-            "    \n",
-            "    # Panel 3: DiffusionNet Prediction\n",
-            "    axes[row_idx, 2].imshow(canvas)\n",
-            "    if d_box and d_cat:\n",
-            "        col = CLASS_METADATA[d_cat]['color']\n",
-            "        nm = CLASS_METADATA[d_cat]['name']\n",
-            "        rect = patches.Rectangle((d_box[0], d_box[1]), d_box[2], d_box[3], linewidth=2.5, edgecolor=col, facecolor='none')\n",
-            "        axes[row_idx, 2].add_patch(rect)\n",
-            "        axes[row_idx, 2].text(d_box[0], max(0, d_box[1] - 4), f'{nm} ({d_score:.2f})', color='white', fontsize=8.5, fontweight='bold',\n",
-            "                              bbox=dict(boxstyle='square,pad=0.2', facecolor=col, alpha=0.9, edgecolor='none'))\n",
-            "        axes[row_idx, 2].set_title(f'DiffusionNet Prediction: {nm} ({d_score:.2f})', fontsize=10.5, fontweight='bold')\n",
-            "    else:\n",
-            "        axes[row_idx, 2].set_title('DiffusionNet: Suppressed / No Detection', fontsize=10.5, fontweight='bold', color='#555555')\n",
-            "    axes[row_idx, 2].axis('off')\n",
-            "\n",
-            "plt.suptitle('Top 5 Clinical Failure Modes: Ground Truth Reference vs Model Predictions', fontsize=14, fontweight='bold', y=0.995)\n",
-            "plt.tight_layout(rect=[0, 0, 1, 0.98])\n",
-            "plt.show()\n"
-        ]
-    })
-
-    # =========================================================================
-    # Cell 8: Clinical Comparative Synthesis & Markdown Report (Code)
-    # =========================================================================
-    cells.append({
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": [
-            "from IPython.display import display, Markdown\n",
-            "\n",
-            "# Compute summary metrics for publication report\n",
-            "h_tps = error_stats['HierarchicalNet']['TP']\n",
-            "h_fps = error_stats['HierarchicalNet']['Cls'] + error_stats['HierarchicalNet']['Loc'] + error_stats['HierarchicalNet']['Bkg']\n",
-            "h_fns = error_stats['HierarchicalNet']['Missed']\n",
-            "h_prec = (h_tps / (h_tps + h_fps) * 100.0) if (h_tps + h_fps) > 0 else 0.0\n",
-            "h_rec = (h_tps / (h_tps + h_fns) * 100.0) if (h_tps + h_fns) > 0 else 0.0\n",
-            "h_f1 = (2 * h_prec * h_rec / (h_prec + h_rec)) if (h_prec + h_rec) > 0 else 0.0\n",
-            "\n",
-            "d_tps = error_stats['DiffusionNet']['TP']\n",
-            "d_fps = error_stats['DiffusionNet']['Cls'] + error_stats['DiffusionNet']['Loc'] + error_stats['DiffusionNet']['Bkg']\n",
-            "d_fns = error_stats['DiffusionNet']['Missed']\n",
-            "d_prec = (d_tps / (d_tps + d_fps) * 100.0) if (d_tps + d_fps) > 0 else 0.0\n",
-            "d_rec = (d_tps / (d_tps + d_fns) * 100.0) if (d_tps + d_fns) > 0 else 0.0\n",
-            "d_f1 = (2 * d_prec * d_rec / (d_prec + d_rec)) if (d_prec + d_rec) > 0 else 0.0\n",
-            "\n",
-            "h_mean_iou = float(np.mean(h_tp_ious)) if h_tp_ious else 0.0\n",
-            "d_mean_iou = float(np.mean(d_tp_ious)) if d_tp_ious else 0.0\n",
-            "\n",
-            "report_md = f\"\"\"\n",
-            "# Clinical Comparative Synthesis & Translation Report\n",
-            "\n",
-            "## 1. Quantitative Benchmark Summary\n",
-            "\n",
-            "| Performance Metric | HierarchicalNet (FPN Queries) | DiffusionNet (Reverse Diffusion) | Clinical Advantage |\n",
-            "| :--- | :---: | :---: | :--- |\n",
-            "| **Overall Precision** | {h_prec:.1f}% | {d_prec:.1f}% | {'DiffusionNet (+ higher specificity)' if d_prec >= h_prec else 'HierarchicalNet'} |\n",
-            "| **Overall Sensitivity (Recall)** | {h_rec:.1f}% | {d_rec:.1f}% | {'DiffusionNet' if d_rec >= h_rec else 'HierarchicalNet (+ higher triage capture)'} |\n",
-            "| **F1 Diagnostic Score** | {h_f1:.1f}% | {d_f1:.1f}% | {'DiffusionNet' if d_f1 >= h_f1 else 'HierarchicalNet'} |\n",
-            "| **Boundary Sharpness (Mean TP IoU)** | {h_mean_iou:.2f} | {d_mean_iou:.2f} | {'DiffusionNet (tighter lesion localization)' if d_mean_iou >= h_mean_iou else 'HierarchicalNet'} |\n",
-            "| **Background False Positives (Bkg)** | {error_stats['HierarchicalNet']['Bkg']} | {error_stats['DiffusionNet']['Bkg']} | {'DiffusionNet (fewer normal anatomy hallucinations)' if error_stats['DiffusionNet']['Bkg'] <= error_stats['HierarchicalNet']['Bkg'] else 'HierarchicalNet'} |\n",
-            "| **Inference Latency per Scan** | ~{res_h_test['latency_ms']:.1f} ms | ~{res_d_test['latency_ms']:.1f} ms | HierarchicalNet (~2-5x faster deterministic inference) |\n",
-            "\n",
-            "---\n",
-            "\n",
-            "## 2. Key Clinical Insights & Architectural Trade-offs\n",
-            "\n",
-            "### Architectural Strengths of HierarchicalNet:\n",
-            "1. **High-Throughput Chairside Screening**: Operating via single-pass deterministic feature pyramids, HierarchicalNet delivers real-time inference suitable for immediate chairside triage.\n",
-            "2. **Broad Pathology Recall**: The multi-scale pyramid captures large structures (e.g., deeply impacted third molars) with robust global context.\n",
-            "\n",
-            "### Architectural Strengths of DiffusionNet:\n",
-            "1. **Boundary Sharpness on Diffuse Lesions**: The iterative reverse diffusion process excels at homing in on diffuse, non-corticated periapical osteolytic borders, yielding superior localization tightness.\n",
-            "2. **Rejection of Normal Anatomical Pseudo-Lesions**: Progressive denoising steps allow the model to evaluate context, rejecting radiolucent mental foramina and maxillary recesses.\n",
-            "\n",
-            "---\n",
-            "\n",
-            "## 3. Recommended Clinical Deployment Strategy\n",
-            "\n",
-            "```\n",
-            "Panoramic Radiograph Ingestion\n",
-            "          │\n",
-            "          ▼\n",
-            "┌──────────────────────────────────────────────┐\n",
-            "│ Stage 1: Rapid Screening (HierarchicalNet)   │ ──> High Sensitivity Triage (Threshold = 0.25)\n",
-            "└──────────────────────────────────────────────┘\n",
-            "          │\n",
-            "          ▼ Flagged Ambiguous Regions of Interest (ROIs)\n",
-            "┌──────────────────────────────────────────────┐\n",
-            "│ Stage 2: Deep Refinement (DiffusionNet)      │ ──> Boundary Verification & Pseudo-Lesion Filtering\n",
-            "└──────────────────────────────────────────────┘\n",
-            "          │\n",
-            "          ▼\n",
-            "Clinician Review with Color-Coded Overlay & Dual-Threshold Confidence Indicators\n",
-            "```\n",
-            "\n",
-            "### Practical Directives for Chairside Practitioners:\n",
-            "- **Dual-Thresholding**: Use a relaxed threshold (0.25) during preventative checkups to maximize screening sensitivity; apply a strict threshold (0.50) when planning irreversible restorative or endodontic interventions.\n",
-            "- **Bitewing Corroboration**: Always confirm interproximal radiolucencies with dedicated bitewings to rule out optical cervical burnout and verify true pulpal proximity.\n",
-            "- **Mental Foramen Cross-Check**: Check premolar apical radiolucencies against the contralateral side and examine continuity of the lamina dura to distinguish anatomical foramina from true periapical pathosis.\n",
-            "\"\"\"\n",
-            "\n",
-            "display(Markdown(report_md))\n"
-        ]
-    })
-
     notebook_data = {
-        "cells": cells,
+        "cells": CELLS,
         "metadata": {
-            "kernelspec": {
-                "display_name": "Python 3",
-                "language": "python",
-                "name": "python3"
-            },
-            "language_info": {
-                "codemirror_mode": {
-                    "name": "ipython",
-                    "version": 3
-                },
-                "file_extension": ".py",
-                "mimetype": "text/x-python",
-                "name": "python",
-                "nbconvert_exporter": "python",
-                "pygments_lexer": "ipython3",
-                "version": "3.10.0"
-            }
+            "accelerator": "GPU",
+            "colab": {"provenance": []},
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.10.0"},
         },
         "nbformat": 4,
-        "nbformat_minor": 0
+        "nbformat_minor": 0,
     }
-
     out_path = Path("notebooks/dentex_inference_error_analysis.ipynb")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(notebook_data, f, indent=2)
-    print(f"Built {out_path} with {len(cells)} cells.")
+        json.dump(notebook_data, f, indent=2, ensure_ascii=False)
+    print(f"Built {out_path} with {len(CELLS)} cells.")
 
 
 if __name__ == "__main__":

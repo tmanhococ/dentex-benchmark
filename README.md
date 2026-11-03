@@ -26,11 +26,13 @@ The benchmark standardizes detection across the **4 clinical dental abnormality 
 
 ## 2. Evaluated Model Architectures
 
-The benchmark centers on two advanced detection paradigms for 4-class dental abnormality detection, evaluated alongside classical baselines under identical train/validation splits, multi-scale augmentations, and evaluation protocols:
+The benchmark centers on two advanced detection paradigms for 4-class dental abnormality detection, evaluated alongside classical baselines under identical train/validation splits and evaluation protocols:
 
 ### Primary Benchmark Architectures
-1. **HierarchicalNet (`hierarchical_net`)**: Multi-scale feature hierarchy with ResNet-50 backbone and Feature Pyramid Network (FPN, $P_2 \rightarrow P_5$). Designed to effectively detect pathologies with extreme spatial scale differences (from tiny enamel caries to large impacted third molars).
-2. **DiffusionNet (`diffusion_net`)**: Denoising diffusion probabilistic model (DiffusionDet paradigm) with `DynamicDiffusionHead`. Utilizes sinusoidal timestep embeddings and iterative progressive box denoising for pathology localization and classification.
+1. **HierarchicalNet (`hierarchical_net`)**: ResNet-50 + FPN ($P_2 \rightarrow P_6$) two-stage detector: region proposals on every pyramid level and multi-level RoIAlign, so each lesion is pooled from the scale that matches its size. Initialised from COCO Faster R-CNN v2 weights.
+2. **DiffusionNet (`diffusion_net`)**: DiffusionDet-style detector on the same ResNet-50 + FPN backbone. Ground-truth boxes are corrupted by the forward diffusion process during training; three cascade stages refine each noisy box from RoIAlign features pooled at its location (with proposal self-attention and timestep FiLM), trained with Hungarian matching and focal + L1 + GIoU losses. Inference runs seeded DDIM sampling with box renewal.
+
+> **v2 note:** the first versions of both models global-average-pooled the feature maps, so their boxes could not depend on lesion position, and `scripts/evaluate.py --compare_all` printed a hardcoded results table. Both are fixed; checkpoints from the old architecture are rejected on load and must be retrained.
 
 ### Classical Detection Baselines
 3. **Faster R-CNN (`faster_rcnn`)**: Two-stage anchor-based CNN baseline with ResNet50-FPN backbone and Fast R-CNN box regression head.
@@ -69,7 +71,7 @@ python scripts/setup_env.py
 ## 5. CLI Pipeline Workflow
 
 ### Step 1: Download & Prepare Dataset
-Downloads data from HuggingFace Hub (`ibrahimhamamci/DENTEX`) or parses local raw archives, producing standard COCO annotations (`instances_train.json`, `instances_val.json`) with an 80/20 stratified split:
+Downloads data from HuggingFace Hub (`ibrahimhamamci/DENTEX`) or parses local raw archives, producing standard COCO annotations (`instances_train.json`, `instances_val.json`) with a seeded 80/20 random split by image (train/val image ids are disjoint; duplicate ids abort preparation):
 
 ```bash
 python scripts/download_and_prepare.py --seed 42
@@ -94,7 +96,7 @@ python scripts/train.py --model dino --epochs 30 --lr 0.0001
 Evaluate all trained models or an individual checkpoint on validation data:
 
 ```bash
-# Evaluate and compare all available checkpoints
+# Evaluate every model that has outputs/<model>/best.pth (fails if none exists)
 python scripts/evaluate.py --compare_all
 
 # Or evaluate a specific model checkpoint

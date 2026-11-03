@@ -1,7 +1,6 @@
 # dentex_bench/eval/reporter.py
 import csv
-import matplotlib
-matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path

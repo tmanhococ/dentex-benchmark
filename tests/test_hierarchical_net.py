@@ -7,82 +7,67 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 import torch
 from dentex_bench.config import BenchmarkConfig
-from dentex_bench.models.hierarchical_net import (
-    HierarchicalNetRunner,
-    FeaturePyramidNetwork,
-    HierarchicalDetectionHead
-)
+from dentex_bench.models.hierarchical_net import HierarchicalNetRunner
 
 
-def test_fpn_and_head_shapes():
-    dim = 256
-    fpn = FeaturePyramidNetwork(in_channels=[256, 512, 1024, 2048], out_channels=dim)
-    c2 = torch.rand(2, 256, 64, 64)
-    c3 = torch.rand(2, 512, 32, 32)
-    c4 = torch.rand(2, 1024, 16, 16)
-    c5 = torch.rand(2, 2048, 8, 8)
-    pyramid = fpn([c2, c3, c4, c5])
-    assert len(pyramid) == 4
-    for p in pyramid:
-        assert p.shape[1] == dim
-
-    head = HierarchicalDetectionHead(in_channels=dim, num_classes=4, num_proposals=100)
-    logits, pred_boxes = head(pyramid)
-    assert logits.shape == (2, 100, 5)  # 4 classes + 1 background
-    assert pred_boxes.shape == (2, 100, 4)
-    assert (pred_boxes >= 0.0).all() and (pred_boxes <= 1.0).all()
-
-
-def test_hierarchical_net_build_and_predict():
+def _runner(**overrides):
     cfg = BenchmarkConfig.from_auto_env()
+    cfg.img_size, cfg.max_size = 256, 512
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
     runner = HierarchicalNetRunner(cfg)
-    model = runner.build_model(pretrained=False)
-    assert model is not None
-    assert runner.model is model
-    assert runner.optimizer is not None
+    runner.build_model(pretrained=False)
+    return runner
 
-    dummy_imgs = [torch.rand(3, 400, 400)]
-    preds = runner.predict(dummy_imgs)
+
+def test_hierarchical_net_predicts_boxes_in_input_pixel_frame():
+    runner = _runner()
+    preds = runner.predict([torch.rand(3, 300, 700)])
     assert len(preds) == 1
-    assert "boxes" in preds[0]
-    assert "labels" in preds[0]
-    assert "scores" in preds[0]
-    assert preds[0]["boxes"].ndim == 2
-    assert preds[0]["boxes"].shape[-1] == 4
+    boxes, labels, scores = preds[0]["boxes"], preds[0]["labels"], preds[0]["scores"]
+    assert boxes.ndim == 2 and boxes.shape[-1] == 4
+    assert len(boxes) == len(labels) == len(scores) <= 100
+    if len(boxes):
+        assert boxes[:, 0::2].min() >= 0 and boxes[:, 0::2].max() <= 700
+        assert boxes[:, 1::2].min() >= 0 and boxes[:, 1::2].max() <= 300
+        assert labels.min() >= 1 and labels.max() <= 4
 
 
 def test_hierarchical_net_train_epoch():
-    cfg = BenchmarkConfig.from_auto_env()
-    cfg.gradient_accumulation_steps = 2
-    runner = HierarchicalNetRunner(cfg)
-    runner.build_model(pretrained=False)
-
+    runner = _runner(gradient_accumulation_steps=2)
     images = [torch.rand(3, 200, 200), torch.rand(3, 220, 220)]
     targets = [
         {"boxes": torch.tensor([[10.0, 10.0, 50.0, 50.0]]), "labels": torch.tensor([1])},
-        {"boxes": torch.tensor([[20.0, 20.0, 60.0, 60.0]]), "labels": torch.tensor([2])}
+        # Scans without any of the 4 pathologies exist in DENTEX
+        {"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)}
     ]
-    batch = (images, targets)
-    dataloader = [batch, batch]
-
-    loss_dict = runner.train_epoch(dataloader, epoch=1)
-    assert "loss" in loss_dict
+    loss_dict = runner.train_epoch([(images, targets), (images, targets)], epoch=1)
     assert isinstance(loss_dict["loss"], float)
     assert loss_dict["loss"] >= 0.0
     assert torch.isfinite(torch.tensor(loss_dict["loss"]))
 
 
 def test_hierarchical_net_checkpoint(tmp_path):
-    cfg = BenchmarkConfig.from_auto_env()
-    runner = HierarchicalNetRunner(cfg)
-    runner.build_model(pretrained=False)
-
+    runner = _runner()
     ckpt_path = tmp_path / "checkpoints" / "hierarchical_net_test.pth"
-    runner.save_checkpoint(ckpt_path, extra_info={"epoch": 5, "val_loss": 0.42})
+    runner.save_checkpoint(ckpt_path, extra_info={"epoch": 5, "val_mAP50": 0.42})
     assert ckpt_path.exists()
 
-    runner2 = HierarchicalNetRunner(cfg)
-    runner2.build_model(pretrained=False)
-    info = runner2.load_checkpoint(ckpt_path)
+    info = _runner().load_checkpoint(ckpt_path)
     assert info.get("epoch") == 5
-    assert info.get("val_loss") == 0.42
+    assert info.get("val_mAP50") == 0.42
+
+
+def test_hierarchical_net_checkpoint_from_pretrained_run_loads_into_evaluation_runner(tmp_path):
+    # Training builds with COCO weights, evaluation rebuilds without them before loading best.pth
+    cfg = BenchmarkConfig.from_auto_env()
+    trained = HierarchicalNetRunner(cfg)
+    trained.build_model(pretrained=True)
+    ckpt = tmp_path / "best.pth"
+    trained.save_checkpoint(ckpt)
+
+    evaluator = HierarchicalNetRunner(cfg)
+    evaluator.build_model(pretrained=False)
+    evaluator.load_checkpoint(ckpt)
+    trainable = lambda r: [n for n, p in r.model.named_parameters() if p.requires_grad]
+    assert trainable(evaluator) == trainable(trained)
