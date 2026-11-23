@@ -195,10 +195,88 @@ def test_placement_impacted_on_tooth_8_succeeds():
     assert plan.ops[0].mirror is True
 
 
+def test_placement_multi_op_uniqueness():
+    """Verify that multiple operations in a single plan target distinct FDI positions."""
+    cfg = load_config("configs/augment/base.yaml")
+    cfg.placement.min_ops = 3
+    cfg.placement.max_ops = 3
+
+    # Bank has 4 distinct upper teeth
+    entries = [
+        _make_dummy_entry(entry_id=f"1_{fdi}", image_id=1, fdi=fdi, roi_class="caries")
+        for fdi in (14, 15, 16, 17)
+    ]
+    bank = ToothBank(entries)
+
+    # Target has matching 4 teeth
+    locator = AnnotationToothLocator([
+        {"image_id": 2, "fdi": 14, "bbox": [10, 20, 30, 40]},
+        {"image_id": 2, "fdi": 15, "bbox": [40, 20, 30, 40]},
+        {"image_id": 2, "fdi": 16, "bbox": [70, 20, 30, 40]},
+        {"image_id": 2, "fdi": 17, "bbox": [100, 20, 30, 40]},
+    ])
+    rng = rng_for(42, "test_multi_op")
+    plan = generate_swap_plan(2, cfg, bank, locator, rng)
+
+    assert len(plan.ops) == 3
+    target_fdis = [op.target_fdi for op in plan.ops]
+    # Each op must target a unique tooth
+    assert len(target_fdis) == len(set(target_fdis))
+
+
+def test_placement_rejects_scale_out_of_bounds():
+    """Verify that candidate tooth with mismatched scale ratio is rejected with R_SCALE."""
+    cfg = load_config("configs/augment/base.yaml")
+    # Entry with width 100
+    entry_large = _make_dummy_entry(
+        entry_id="1_16", image_id=1, fdi=16, bbox_xywh=[10, 20, 100, 40]
+    )
+    bank = ToothBank([entry_large])
+
+    # Target with width 30 (ratio = 30/100 = 0.3, outside [0.85, 1.15])
+    locator = AnnotationToothLocator([
+        {"image_id": 2, "category_id_1": 1, "category_id_2": 6, "bbox": [10, 20, 30, 40]}
+    ])
+    rng = rng_for(42, "test_scale_reject")
+    plan = generate_swap_plan(2, cfg, bank, locator, rng)
+
+    assert len(plan.ops) == 0
+    assert any(r["code"] == "R_SCALE" for r in plan.rejections)
+
+
+def test_placement_class_frequency_weighting():
+    """Verify inverse frequency class weighting selects rare classes."""
+    cfg = load_config("configs/augment/base.yaml")
+    cfg.placement.class_weights = None
+    cfg.placement.class_weight_power = 0.5
+
+    # 10 caries entries, 1 periapical entry
+    entries = [
+        _make_dummy_entry(entry_id=f"1_{i}", image_id=1, fdi=16, roi_class="caries")
+        for i in range(10)
+    ]
+    entries.append(
+        _make_dummy_entry(entry_id="1_rare", image_id=1, fdi=16, roi_class="periapical")
+    )
+    bank = ToothBank(entries)
+
+    locator = AnnotationToothLocator([
+        {"image_id": 2, "fdi": 16, "bbox": [10, 20, 30, 40]}
+    ])
+    rng = rng_for(42, "test_class_weight")
+    plan = generate_swap_plan(2, cfg, bank, locator, rng)
+    assert len(plan.ops) == 1
+
+
 def test_rejection_rule_helpers():
-    # Test check_scale_rule
+    # Test check_scale_rule: valid
     assert check_scale_rule([0, 0, 100, 100], [0, 0, 100, 100], 0.85, 1.15) is True
+    # Both axes outside
     assert check_scale_rule([0, 0, 100, 100], [0, 0, 200, 200], 0.85, 1.15) is False
+    # Either axis outside (width ok, height outside)
+    assert check_scale_rule([0, 0, 100, 100], [0, 0, 100, 150], 0.85, 1.15) is False
+    # Either axis outside (width outside, height ok)
+    assert check_scale_rule([0, 0, 100, 100], [0, 0, 150, 100], 0.85, 1.15) is False
 
     # Test check_angle_rule
     assert check_angle_rule(5.0, 10.0, 10.0) is True
