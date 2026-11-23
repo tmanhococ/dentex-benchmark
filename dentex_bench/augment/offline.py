@@ -160,12 +160,18 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
     # 2. Bank setup & persistence
     bank_dir = run_dir / "bank"
     if bank is None:
-        if ToothBank.is_cached(bank_dir):
+        if ToothBank.is_cached(bank_dir) and not cfg.output.overwrite and len(ToothBank.load(bank_dir).entries) > 0:
             bank = ToothBank.load(bank_dir)
         elif ToothBank.is_cached(Path(cfg.paths.out_root) / "bank"):
             bank = ToothBank.load(Path(cfg.paths.out_root) / "bank")
+        elif ToothBank.is_cached(Path("outputs/bank")):
+            bank = ToothBank.load(Path("outputs/bank"))
         else:
-            bank = ToothBank.build(cfg)
+            try:
+                from scripts.build_bank import build_bank_from_config
+                bank = build_bank_from_config(out_bank_dir=bank_dir)
+            except Exception:
+                bank = ToothBank.build(cfg)
     bank.save(bank_dir)
 
     # 3. Load dataset annotations
