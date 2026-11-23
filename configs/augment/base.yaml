@@ -1,0 +1,101 @@
+version: 1
+global_seed: 0
+run_name: "base"
+paths:
+  data_root: "data"
+  train_ann: "data/processed/instances_train.json"
+  val_ann:   "data/processed/instances_val.json"
+  img_dir:   "data/raw"
+  out_root:  "outputs/augment"
+
+mode: offline
+
+bank:
+  mask_source: polygon
+  active_contour: false
+  crop_margin_px: 24
+  roi:
+    caries_dilate_px: 4
+    periapical_bbox_expand: 0.15
+    impacted_dilate_px: 9
+    healthy_dilate_px: 4
+  include_healthy: false
+  healthy_filter:
+    predictions_file: null
+    max_disease_score: 0.1
+  evaluate_mask_methods: false
+
+locator:
+  providers: [annotations]
+  pseudo_label_file: null
+  min_score: 0.5
+
+placement:
+  mode: fdi_swap
+  swap_types: [disease_to_disease]
+  allow_mirror: true
+  min_ops: 1
+  max_ops: 3
+  max_tries: 20
+  class_weight_power: 0.5
+  class_weights: null
+  max_neighbor_iou: 0.1
+  max_arch_dev_ratio: 0.5
+
+geometry:
+  isotropic: false
+  scale_min: 0.85
+  scale_max: 1.15
+  max_rotate_deg: 10
+  jitter_scale: 0.05
+  jitter_rotate_deg: 3
+
+blend:
+  inpaint_target: true
+  inpaint_radius: 5
+  intensity_match: meanstd
+  mode: core_preserving
+  choices: [hard, feather, poisson_normal, laplacian, core_preserving]
+  feather_sigma: 5
+  pyramid_levels: 5
+  core_erode_px: 6
+  ring_mode: feather
+  noise_match: true
+  log_domain: false
+
+instance_aug:
+  gamma: [0.85, 1.15]
+  elastic: {enabled: false, alpha: 10, sigma: 8}
+
+extras:
+  hard_negative: {enabled: false, p: 0.3, max_per_image: 2}
+  erase_disease: {enabled: false, p: 0.1}
+  photometric:   {enabled: false, p: 0.5, clahe_clip: [1.5, 3.0], clahe_tiles: [8, 16], gamma: [0.8, 1.2]}
+  patch_crop:    {enabled: false, p: 0.5, sizes: [1024, 1333], min_visible: 0.6, prefer_synthetic: true}
+
+sampling:
+  rfs: {enabled: false, t: null, target_repeat: {periapical: 2.5}}
+
+offline:
+  variants_per_image: 2
+  num_workers: 1
+
+online:
+  p: 0.5
+  log_recipes: false
+
+qc:
+  max_seam_score: 2.5
+  save_debug_every_n: 50
+
+base_transforms:
+  brightness_contrast: {p: 0.5, limit: 0.15}
+  rotate: {p: 0.3, limit_deg: 5}
+  hflip: {p: 0.5}
+
+output:
+  save_dataset: true
+  formats: [coco, yolo]
+  include_originals: true
+  image_ext: png
+  overwrite: false
