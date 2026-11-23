@@ -1,0 +1,138 @@
+{
+  "images": [
+    {
+      "id": 1,
+      "file_name": "sample_xray_001.png",
+      "width": 800,
+      "height": 400
+    },
+    {
+      "id": 2,
+      "file_name": "sample_xray_002.png",
+      "width": 800,
+      "height": 400
+    },
+    {
+      "id": 3,
+      "file_name": "sample_xray_003.png",
+      "width": 800,
+      "height": 400
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "fdi": 16,
+      "category_id_1": 1,
+      "category_id_2": 6,
+      "bbox": [
+        180,
+        180,
+        45,
+        40
+      ],
+      "area": 1800.0,
+      "iscrowd": 0
+    },
+    {
+      "id": 2,
+      "image_id": 1,
+      "category_id": 2,
+      "fdi": 36,
+      "category_id_1": 3,
+      "category_id_2": 6,
+      "bbox": [
+        470,
+        220,
+        70,
+        65
+      ],
+      "area": 4550.0,
+      "iscrowd": 0
+    },
+    {
+      "id": 3,
+      "image_id": 2,
+      "category_id": 2,
+      "fdi": 26,
+      "category_id_1": 2,
+      "category_id_2": 6,
+      "bbox": [
+        210,
+        180,
+        45,
+        40
+      ],
+      "area": 1800.0,
+      "iscrowd": 0
+    },
+    {
+      "id": 4,
+      "image_id": 2,
+      "category_id": 3,
+      "fdi": 46,
+      "category_id_1": 4,
+      "category_id_2": 6,
+      "bbox": [
+        490,
+        220,
+        70,
+        65
+      ],
+      "area": 4550.0,
+      "iscrowd": 0
+    },
+    {
+      "id": 5,
+      "image_id": 3,
+      "category_id": 3,
+      "fdi": 16,
+      "category_id_1": 1,
+      "category_id_2": 6,
+      "bbox": [
+        240,
+        180,
+        45,
+        40
+      ],
+      "area": 1800.0,
+      "iscrowd": 0
+    },
+    {
+      "id": 6,
+      "image_id": 3,
+      "category_id": 4,
+      "fdi": 38,
+      "category_id_1": 3,
+      "category_id_2": 8,
+      "bbox": [
+        510,
+        220,
+        70,
+        65
+      ],
+      "area": 4550.0,
+      "iscrowd": 0
+    }
+  ],
+  "categories": [
+    {
+      "id": 1,
+      "name": "Caries"
+    },
+    {
+      "id": 2,
+      "name": "Deep Caries"
+    },
+    {
+      "id": 3,
+      "name": "Periapical Lesion"
+    },
+    {
+      "id": 4,
+      "name": "Impacted Tooth"
+    }
+  ]
+}
