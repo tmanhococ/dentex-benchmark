@@ -8,6 +8,7 @@ from dentex_bench.augment.recipe import resolve, execute, Recipe
 from dentex_bench.augment.config import AugmentConfig
 from dentex_bench.augment.bank import ToothBank, ToothEntry
 from dentex_bench.augment.locator import AnnotationToothLocator
+from dentex_bench.augment.io_utils import write_image_lossless
 
 
 def test_execute_is_pure_deterministic(monkeypatch):
@@ -216,3 +217,93 @@ def test_resolve_blend_mode_random_choice():
     r = resolve(10, ("offline", 10, 0), cfg, bank, locator)
     assert r is not None
     assert r.ops[0]["blend_mode"] in ["hard", "feather"]
+
+
+def test_execute_with_saved_patch_file(tmp_path):
+    # Create saved patch (60x60) and mask (60x60)
+    patch_img = np.full((60, 60, 3), 200, dtype=np.uint8)
+    mask_img = np.zeros((60, 60), dtype=np.uint8)
+    mask_img[10:50, 10:50] = 255
+
+    patch_path = str(tmp_path / "patch.png")
+    mask_path = str(tmp_path / "mask.png")
+    write_image_lossless(patch_path, patch_img)
+    write_image_lossless(mask_path, mask_img)
+
+    src_entry = ToothEntry(
+        entry_id="bank_saved",
+        image_id=99,
+        file_name="99.png",
+        fdi=16,
+        is_upper=True,
+        labels=["periapical_lesion"],
+        is_healthy=False,
+        roi_class="periapical",
+        bbox_xywh=[10.0, 10.0, 40.0, 40.0],
+        roi_xywh=[0, 0, 60, 60],
+        annotations=[{"category_id": 3, "bbox": [10.0, 10.0, 40.0, 40.0]}],
+        axis_angle_deg=0.0,
+        mask_area_px=1600,
+        mask_h=40.0,
+        mask_w=40.0,
+        ring_stats={},
+        noise_sigma=1.0,
+        patch_path=patch_path,
+        mask_path=mask_path,
+        roi_mask_path=mask_path,
+        mask_source="polygon",
+    )
+    bank = ToothBank([src_entry])
+
+    # Target image is 200x200 filled with 50
+    # Target tooth bbox is at [80.0, 80.0, 40.0, 40.0], exactly matching 40x40 source tooth
+    recipe = Recipe(
+        recipe_id="rec_patch_test",
+        schema_version=1,
+        rng_key=["offline", 10, 0],
+        target_image_id=10,
+        target_file="target.png",
+        target_file_sha256="",
+        ops=[
+            {
+                "op": "swap",
+                "source_entry_id": "bank_saved",
+                "target_fdi": 16,
+                "target_tooth_ref": {
+                    "source": "annotations",
+                    "bbox": [80.0, 80.0, 40.0, 40.0],
+                    "has_mask": True,
+                },
+                "mirror": False,
+                "scale_jitter": 1.0,
+                "rotate_jitter": 0.0,
+                "blend_mode": "hard",
+                "noise_seed": 42,
+                "intensity": {"mode": "meanstd", "a": 1.0, "b": 10.0},
+            }
+        ],
+    )
+
+    target_img = np.full((200, 200, 3), 50, dtype=np.uint8)
+    target_anns = [
+        {"id": 1, "image_id": 10, "fdi": 16, "category_id": 1, "bbox": [80.0, 80.0, 40.0, 40.0]}
+    ]
+    loader = lambda fid: (target_img.copy(), list(target_anns))
+
+    out_img, out_anns, meta = execute(recipe, loader, bank)
+    assert meta["status"] == "success"
+
+    # Verify intensity match: 200 * 1.0 + 10 = 210
+    # Center of target tooth is at (100, 100)
+    assert np.all(out_img[100, 100] == 210)
+    # Outside target tooth remains background 50
+    assert np.all(out_img[10, 10] == 50)
+
+    # Transformed annotation aligns with [80.0, 80.0, 40.0, 40.0]
+    assert len(out_anns) == 1
+    ann = out_anns[0]
+    assert ann["fdi"] == 16
+    assert ann["category_id"] == 3
+    assert ann["synthetic"] is True
+    np.testing.assert_allclose(ann["bbox"], [80.0, 80.0, 40.0, 40.0], atol=1e-3)
+

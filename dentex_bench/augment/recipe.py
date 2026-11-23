@@ -161,14 +161,16 @@ def execute(
 
         # Affine matrix alignment
         src_roi = src_entry.roi_xywh
-        src_cx = src_roi[0] + src_roi[2] / 2.0
-        src_cy = src_roi[1] + src_roi[3] / 2.0
+        src_bw = max(1.0, float(src_entry.bbox_xywh[2]))
+        src_bh = max(1.0, float(src_entry.bbox_xywh[3]))
+        src_cx = (src_entry.bbox_xywh[0] - src_roi[0]) + src_entry.bbox_xywh[2] / 2.0
+        src_cy = (src_entry.bbox_xywh[1] - src_roi[1]) + src_entry.bbox_xywh[3] / 2.0
         dst_cx = dst_bbox[0] + dst_bbox[2] / 2.0
         dst_cy = dst_bbox[1] + dst_bbox[3] / 2.0
 
         scale_jitter = op_data.get("scale_jitter", 1.0)
-        scale_x = (dst_bbox[2] / max(1.0, float(src_roi[2]))) * scale_jitter
-        scale_y = (dst_bbox[3] / max(1.0, float(src_roi[3]))) * scale_jitter
+        scale_x = (dst_bbox[2] / src_bw) * scale_jitter
+        scale_y = (dst_bbox[3] / src_bh) * scale_jitter
 
         rot_jitter = op_data.get("rotate_jitter", 0.0)
         M = compute_affine_matrix(
@@ -185,8 +187,12 @@ def execute(
         has_patch = bool(src_entry.patch_path and Path(src_entry.patch_path).is_file())
         has_mask = bool(src_entry.roi_mask_path and Path(src_entry.roi_mask_path).is_file())
 
+        intensity_cfg = op_data.get("intensity")
         if has_patch:
             patch = read_image_lossless(src_entry.patch_path)
+            if intensity_cfg and isinstance(intensity_cfg, dict) and intensity_cfg.get("mode", "none") != "none":
+                patch = apply_intensity_match(patch, intensity_cfg)
+
             if has_mask:
                 mask = read_image_lossless(src_entry.roi_mask_path)
             else:
@@ -202,6 +208,8 @@ def execute(
             )
         else:
             dummy_patch = np.full_like(out_img, 180)
+            if intensity_cfg and isinstance(intensity_cfg, dict) and intensity_cfg.get("mode", "none") != "none":
+                dummy_patch = apply_intensity_match(dummy_patch, intensity_cfg)
             dummy_mask = np.zeros((h, w), dtype=np.uint8)
             y1, y2 = max(0, int(dst_cy - 20)), min(h, int(dst_cy + 20))
             x1, x2 = max(0, int(dst_cx - 20)), min(w, int(dst_cx + 20))
