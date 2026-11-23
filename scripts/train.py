@@ -43,7 +43,57 @@ def parse_args(args=None):
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing raw/ and processed/")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory where checkpoints are saved")
+    parser.add_argument("--augment-config", type=str, default=None, help="Path to online augmentation YAML config")
+    parser.add_argument("--train-ann", type=str, default=None, help="Path to custom training annotations file (e.g. offline augmented COCO JSON)")
     return parser.parse_args(args)
+
+
+def resolve_ann_paths(args) -> tuple[Path, Path]:
+    """
+    Resolve (train_ann, val_ann) and enforce INV-2: validation set is never augmented
+    and cannot be replaced by training annotations.
+    """
+    data_dir = Path(args.data_dir)
+    train_ann = Path(args.train_ann) if getattr(args, "train_ann", None) else data_dir / "processed" / "instances_train.json"
+    val_ann = data_dir / "processed" / "instances_val.json"
+    if train_ann.resolve() == val_ann.resolve():
+        raise AssertionError(
+            f"INV-2 VIOLATION: val_ann ({val_ann}) must never be replaced by or equal to train_ann ({train_ann})."
+        )
+    return train_ann, val_ann
+
+
+def get_augment_metadata(train_ann: Path | None, augment_config_path: str | None = None) -> dict:
+    """Extract augmentation metadata and manifest hash for logging into checkpoints."""
+    metadata = {}
+    if train_ann is not None:
+        train_ann = Path(train_ann)
+        metadata["custom_train_ann"] = str(train_ann)
+        candidates = [
+            train_ann.parent / "manifest.json",
+            train_ann.parent / "state" / "manifest.json",
+            train_ann.parent.parent / "state" / "manifest.json",
+        ]
+        for c in candidates:
+            if c.is_file():
+                try:
+                    with open(c, "r", encoding="utf-8") as f:
+                        m_data = json.load(f)
+                    m_hash = m_data.get("manifest_hash")
+                    if m_hash:
+                        metadata["manifest_hash"] = m_hash
+                    metadata["manifest_path"] = str(c)
+                    break
+                except Exception:
+                    pass
+
+    if augment_config_path:
+        from dentex_bench.augment.config import load_config
+        aug_cfg = load_config(augment_config_path)
+        metadata["augment_config"] = str(augment_config_path)
+        metadata["augment_run_name"] = aug_cfg.run_name
+
+    return metadata
 
 
 def plot_training_history(history: list, output_file: Path):
@@ -93,8 +143,7 @@ def main(args=None):
     runner.build_model()
 
     data_dir = Path(args.data_dir)
-    train_ann = data_dir / "processed" / "instances_train.json"
-    val_ann = data_dir / "processed" / "instances_val.json"
+    train_ann, val_ann = resolve_ann_paths(args)
     if not train_ann.exists():
         print(f"[dentex_bench] Error: Training annotations not found at {train_ann}.")
         print("Please run `python scripts/download_and_prepare.py` first.")
@@ -104,6 +153,32 @@ def main(args=None):
     img_dir = data_dir / "raw" if (data_dir / "raw").is_dir() else data_dir
 
     dataset = DentexDataset(img_dir=img_dir, ann_file=train_ann, target_short=cfg.img_size, max_long=cfg.max_size)
+
+    # Online Augmentation or Offline metadata tracking
+    augment_metadata = get_augment_metadata(
+        train_ann=Path(args.train_ann) if getattr(args, "train_ann", None) else None,
+        augment_config_path=getattr(args, "augment_config", None),
+    )
+    if "manifest_hash" in augment_metadata:
+        print(f"[Augment] Found offline augmentation manifest at {augment_metadata.get('manifest_path')} (hash: {augment_metadata['manifest_hash']})")
+
+    if getattr(args, "augment_config", None):
+        from dentex_bench.augment.config import load_config
+        aug_cfg = load_config(args.augment_config)
+        print(f"[Augment] Loaded online augmentation config: {args.augment_config} (run: {aug_cfg.run_name})")
+        try:
+            from dentex_bench.augment.online import SwapAugmentDataset
+            from dentex_bench.augment.bank import ToothBank
+            bank_dir = Path(aug_cfg.paths.out_root) / "bank"
+            if ToothBank.is_cached(bank_dir):
+                bank = ToothBank.load(bank_dir)
+            else:
+                bank = ToothBank([])
+            dataset = SwapAugmentDataset(base=dataset, cfg=aug_cfg, bank=bank)
+            print("[Augment] Wrapped training dataset with SwapAugmentDataset")
+        except ImportError:
+            print("[Augment] SwapAugmentDataset not yet available; proceeding with standard dataset")
+
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
@@ -123,8 +198,15 @@ def main(args=None):
     best_score = float("-inf")
     history = []
     for epoch in range(1, cfg.epochs + 1):
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
+        elif hasattr(dataloader.dataset, "set_epoch"):
+            dataloader.dataset.set_epoch(epoch)
+
         loss_dict = runner.train_epoch(dataloader, epoch)
         record = {"epoch": epoch, "loss": loss_dict["loss"]}
+        if augment_metadata:
+            record["augmentation"] = augment_metadata
         if val_ann.exists():
             val_metrics = evaluate_runner(runner, val_ann, img_dir)
             record.update({"val_mAP50": val_metrics["mAP50"], "val_mAP50_95": val_metrics["mAP50_95"]})
