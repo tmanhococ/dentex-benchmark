@@ -150,9 +150,14 @@ def main(args=None):
         return 1
 
     # Images are looked up recursively; a missing or mismatched image raises instead of being faked
-    img_dir = data_dir / "raw" if (data_dir / "raw").is_dir() else data_dir
+    val_img_dir = data_dir / "raw" if (data_dir / "raw").is_dir() else data_dir
+    train_img_dir = val_img_dir
+    if train_ann.parent.parent.joinpath("images").is_dir():
+        train_img_dir = train_ann.parent.parent / "images"
+    elif train_ann.parent.joinpath("images").is_dir():
+        train_img_dir = train_ann.parent / "images"
 
-    dataset = DentexDataset(img_dir=img_dir, ann_file=train_ann, target_short=cfg.img_size, max_long=cfg.max_size)
+    dataset = DentexDataset(img_dir=train_img_dir, ann_file=train_ann, target_short=cfg.img_size, max_long=cfg.max_size)
 
     # Online Augmentation or Offline metadata tracking
     augment_metadata = get_augment_metadata(
@@ -208,13 +213,14 @@ def main(args=None):
         if augment_metadata:
             record["augmentation"] = augment_metadata
         if val_ann.exists():
-            val_metrics = evaluate_runner(runner, val_ann, img_dir)
+            val_metrics = evaluate_runner(runner, val_ann, val_img_dir)
             record.update({"val_mAP50": val_metrics["mAP50"], "val_mAP50_95": val_metrics["mAP50_95"]})
             score = val_metrics["mAP50"]
         else:
             score = -loss_dict["loss"]
         history.append(record)
-        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {v:.4f}" for k, v in record.items() if k != "epoch"))
+        format_val = lambda v: f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {format_val(v)}" for k, v in record.items() if k not in ("epoch", "augmentation")))
 
         # Always update last.pth at current epoch
         runner.save_checkpoint(output_dir / "last.pth", extra_info=record)
