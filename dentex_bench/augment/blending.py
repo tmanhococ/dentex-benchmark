@@ -75,8 +75,8 @@ def apply_intensity_match(src_img: np.ndarray, params: Dict[str, Any]) -> np.nda
     """Apply precomputed intensity adjustment."""
     mode = params.get("mode", "none")
     if mode == "meanstd":
-        a = params["a"]
-        b = params["b"]
+        a = params.get("a", 1.0)
+        b = params.get("b", 0.0)
         adjusted = a * src_img.astype(np.float32) + b
         return np.clip(adjusted, 0, 255).astype(src_img.dtype)
     elif mode == "histogram" and "lut" in params:
