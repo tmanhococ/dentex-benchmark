@@ -86,3 +86,70 @@ def apply_intensity_match(src_img: np.ndarray, params: Dict[str, Any]) -> np.nda
             return cv2.LUT(src_uint8, lut)
         return cv2.LUT(src_img, lut)
     return src_img
+
+
+def blend_images(
+    src: np.ndarray,
+    dst: np.ndarray,
+    M: np.ndarray,
+    mode: str = "core_preserving",
+    feather_sigma: float = 5.0,
+    core_erode_px: int = 6,
+    ring_mode: str = "feather",
+    **kwargs: Any,
+) -> np.ndarray:
+    """Multi-mode image compositor for dental X-ray tooth paste."""
+    h, w = dst.shape[:2]
+
+    if M.dtype != np.uint8:
+        M = M.astype(np.uint8)
+    if M.size > 0 and np.max(M) == 1:
+        M = M * 255
+
+    is_3d = dst.ndim == 3 and dst.shape[2] > 1
+
+    if mode == "hard":
+        alpha = (M > 0)[:, :, None].astype(np.float32) if is_3d else (M > 0).astype(np.float32)
+        out = alpha * src.astype(np.float32) + (1.0 - alpha) * dst.astype(np.float32)
+        return np.clip(out, 0, 255).astype(dst.dtype)
+
+    elif mode == "feather":
+        k = int(feather_sigma * 4 + 1) | 1
+        alpha_2d = cv2.GaussianBlur(M.astype(np.float32) / 255.0, (k, k), feather_sigma)
+        alpha = alpha_2d[:, :, None] if is_3d else alpha_2d
+        out = alpha * src.astype(np.float32) + (1.0 - alpha) * dst.astype(np.float32)
+        return np.clip(out, 0, 255).astype(dst.dtype)
+
+    elif mode in ("poisson_normal", "poisson_mixed"):
+        ys, xs = np.where(M > 0)
+        if len(xs) == 0:
+            return dst.copy()
+        center = (int(np.mean(xs)), int(np.mean(ys)))
+        # Pad 2px to avoid border touch error in seamlessClone
+        p_src = cv2.copyMakeBorder(src, 2, 2, 2, 2, cv2.BORDER_REFLECT)
+        p_dst = cv2.copyMakeBorder(dst, 2, 2, 2, 2, cv2.BORDER_REFLECT)
+        p_mask = cv2.copyMakeBorder(M, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
+        p_center = (center[0] + 2, center[1] + 2)
+
+        clone_mode = cv2.NORMAL_CLONE if mode == "poisson_normal" else cv2.MIXED_CLONE
+        cloned = cv2.seamlessClone(p_src, p_dst, p_mask, p_center, clone_mode)
+        return cloned[2 : h + 2, 2 : w + 2]
+
+    elif mode == "core_preserving":
+        # 1. Erode M to create untouched core
+        k = max(1, core_erode_px * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        core_mask = cv2.erode(M, kernel)
+
+        # 2. Blend background using ring_mode
+        ring_blended = blend_images(
+            src, dst, M, mode=ring_mode, feather_sigma=feather_sigma, core_erode_px=core_erode_px, **kwargs
+        )
+
+        # 3. Paste exact src into core
+        alpha_core = (core_mask > 0)[:, :, None].astype(np.float32) if is_3d else (core_mask > 0).astype(np.float32)
+        out = alpha_core * src.astype(np.float32) + (1.0 - alpha_core) * ring_blended.astype(np.float32)
+        return np.clip(out, 0, 255).astype(dst.dtype)
+
+    raise ValueError(f"Unknown blending mode: {mode}")
+
