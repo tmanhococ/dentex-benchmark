@@ -4,6 +4,15 @@ import cv2
 import numpy as np
 
 
+__all__ = [
+    "apply_photometric",
+    "apply_patch_crop",
+    "plan_hard_negative_ops",
+    "plan_disease_erasing_ops",
+]
+
+
+
 def apply_photometric(
     img: np.ndarray,
     clahe_clip: float = 2.0,
@@ -171,3 +180,196 @@ def apply_patch_crop(
             updated_anns.append(new_ann)
 
     return crop, updated_anns
+
+
+def plan_hard_negative_ops(
+    target_image_id: int,
+    healthy_bank_entries: list,
+    locator_teeth: list,
+    rng: Optional[Any] = None,
+    max_per_image: int = 2,
+) -> List[Dict[str, Any]]:
+    """Generate paste_negative ops matching healthy bank entries to located teeth by FDI.
+
+    Preserves destination labels without adding new pathology labels (INV-6 compliant).
+    """
+    if hasattr(healthy_bank_entries, "entries"):
+        bank_entries = healthy_bank_entries.entries
+    else:
+        bank_entries = list(healthy_bank_entries)
+
+    if hasattr(locator_teeth, "teeth"):
+        target_teeth = locator_teeth.teeth(target_image_id)
+    else:
+        target_teeth = list(locator_teeth)
+
+    if rng is not None:
+        if hasattr(rng, "permutation"):
+            indices = rng.permutation(len(target_teeth))
+            target_teeth = [target_teeth[i] for i in indices]
+        elif hasattr(rng, "shuffle"):
+            target_teeth = list(target_teeth)
+            rng.shuffle(target_teeth)
+
+    ops: List[Dict[str, Any]] = []
+    used_fdis = set()
+
+    for tooth in target_teeth:
+        if len(ops) >= max_per_image:
+            break
+
+        tooth_fdi = getattr(tooth, "fdi", None) if not isinstance(tooth, dict) else tooth.get("fdi")
+        if tooth_fdi is None or tooth_fdi in used_fdis:
+            continue
+
+        # Find matching healthy bank entries for this FDI
+        matching = []
+        for e in bank_entries:
+            e_fdi = getattr(e, "fdi", None) if not isinstance(e, dict) else e.get("fdi")
+            if e_fdi == tooth_fdi:
+                matching.append(e)
+
+        if not matching:
+            continue
+
+        # Prefer entries not from the same image
+        diff_img = [
+            e for e in matching
+            if (getattr(e, "image_id", None) if not isinstance(e, dict) else e.get("image_id")) != target_image_id
+        ]
+        candidates = diff_img if diff_img else matching
+
+        # Prefer entries with is_healthy == True if available
+        healthy_only = [
+            e for e in candidates
+            if (getattr(e, "is_healthy", True) if not isinstance(e, dict) else e.get("is_healthy", True))
+        ]
+        candidates = healthy_only if healthy_only else candidates
+
+        if not candidates:
+            continue
+
+        if rng is not None:
+            if hasattr(rng, "integers"):
+                chosen = candidates[int(rng.integers(0, len(candidates)))]
+            elif hasattr(rng, "choice"):
+                chosen = rng.choice(candidates)
+            else:
+                chosen = candidates[0]
+        else:
+            chosen = candidates[0]
+
+        entry_id = getattr(chosen, "entry_id", None) if not isinstance(chosen, dict) else chosen.get("entry_id")
+        tooth_bbox = getattr(tooth, "bbox", []) if not isinstance(tooth, dict) else tooth.get("bbox", [])
+        tooth_seg = getattr(tooth, "segmentation", None) if not isinstance(tooth, dict) else tooth.get("segmentation")
+        tooth_source = getattr(tooth, "source", "pseudo_label") if not isinstance(tooth, dict) else tooth.get("source", "pseudo_label")
+
+        ops.append({
+            "op": "paste_negative",
+            "source_entry_id": entry_id,
+            "target_image_id": target_image_id,
+            "target_fdi": int(tooth_fdi),
+            "target_tooth_ref": {
+                "source": tooth_source,
+                "bbox": tooth_bbox,
+                "has_mask": tooth_seg is not None,
+            },
+            "mirror": False,
+        })
+        used_fdis.add(tooth_fdi)
+
+    return ops
+
+
+def plan_disease_erasing_ops(
+    target_image_id: int,
+    diseased_target_teeth: list,
+    healthy_bank_entries: list,
+    rng: Optional[Any] = None,
+    max_per_image: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Generate erase_disease ops replacing diseased teeth with healthy counterparts of matching FDI."""
+    if hasattr(healthy_bank_entries, "entries"):
+        bank_entries = healthy_bank_entries.entries
+    else:
+        bank_entries = list(healthy_bank_entries)
+
+    if hasattr(diseased_target_teeth, "teeth"):
+        target_teeth = diseased_target_teeth.teeth(target_image_id)
+    else:
+        target_teeth = list(diseased_target_teeth)
+
+    if rng is not None:
+        if hasattr(rng, "permutation"):
+            indices = rng.permutation(len(target_teeth))
+            target_teeth = [target_teeth[i] for i in indices]
+        elif hasattr(rng, "shuffle"):
+            target_teeth = list(target_teeth)
+            rng.shuffle(target_teeth)
+
+    ops: List[Dict[str, Any]] = []
+    used_fdis = set()
+
+    for tooth in target_teeth:
+        if max_per_image is not None and len(ops) >= max_per_image:
+            break
+
+        tooth_fdi = getattr(tooth, "fdi", None) if not isinstance(tooth, dict) else tooth.get("fdi")
+        if tooth_fdi is None or tooth_fdi in used_fdis:
+            continue
+
+        matching = []
+        for e in bank_entries:
+            e_fdi = getattr(e, "fdi", None) if not isinstance(e, dict) else e.get("fdi")
+            if e_fdi == tooth_fdi:
+                matching.append(e)
+
+        if not matching:
+            continue
+
+        diff_img = [
+            e for e in matching
+            if (getattr(e, "image_id", None) if not isinstance(e, dict) else e.get("image_id")) != target_image_id
+        ]
+        candidates = diff_img if diff_img else matching
+
+        healthy_only = [
+            e for e in candidates
+            if (getattr(e, "is_healthy", True) if not isinstance(e, dict) else e.get("is_healthy", True))
+        ]
+        candidates = healthy_only if healthy_only else candidates
+
+        if not candidates:
+            continue
+
+        if rng is not None:
+            if hasattr(rng, "integers"):
+                chosen = candidates[int(rng.integers(0, len(candidates)))]
+            elif hasattr(rng, "choice"):
+                chosen = rng.choice(candidates)
+            else:
+                chosen = candidates[0]
+        else:
+            chosen = candidates[0]
+
+        entry_id = getattr(chosen, "entry_id", None) if not isinstance(chosen, dict) else chosen.get("entry_id")
+        tooth_bbox = getattr(tooth, "bbox", []) if not isinstance(tooth, dict) else tooth.get("bbox", [])
+        tooth_seg = getattr(tooth, "segmentation", None) if not isinstance(tooth, dict) else tooth.get("segmentation")
+        tooth_source = getattr(tooth, "source", "annotations") if not isinstance(tooth, dict) else tooth.get("source", "annotations")
+
+        ops.append({
+            "op": "erase_disease",
+            "source_entry_id": entry_id,
+            "target_image_id": target_image_id,
+            "target_fdi": int(tooth_fdi),
+            "target_tooth_ref": {
+                "source": tooth_source,
+                "bbox": tooth_bbox,
+                "has_mask": tooth_seg is not None,
+            },
+            "mirror": False,
+        })
+        used_fdis.add(tooth_fdi)
+
+    return ops
+
