@@ -1,0 +1,7 @@
+_base_: base.yaml
+run_name: "E2_random_paste"
+placement:
+  mode: "random"
+blend:
+  inpaint_target: false
+  mode: "hard"

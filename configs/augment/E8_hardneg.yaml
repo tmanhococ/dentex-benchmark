@@ -1,0 +1,17 @@
+_base_: base.yaml
+run_name: "E8_hardneg"
+placement:
+  mode: "fdi_swap"
+blend:
+  mode: "core_preserving"
+sampling:
+  rfs:
+    enabled: true
+    t: 0.12
+    target_repeat:
+      periapical: 2.5
+extras:
+  hard_negative:
+    enabled: true
+    p: 0.3
+    max_per_image: 2

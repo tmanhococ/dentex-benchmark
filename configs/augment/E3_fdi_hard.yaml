@@ -1,0 +1,6 @@
+_base_: base.yaml
+run_name: "E3_fdi_hard"
+placement:
+  mode: "fdi_swap"
+blend:
+  mode: "hard"

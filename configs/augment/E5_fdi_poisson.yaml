@@ -1,0 +1,6 @@
+_base_: base.yaml
+run_name: "E5_fdi_poisson"
+placement:
+  mode: "fdi_swap"
+blend:
+  mode: "poisson_normal"

@@ -1,0 +1,7 @@
+_base_: base.yaml
+run_name: "E6_core"
+placement:
+  mode: "fdi_swap"
+blend:
+  mode: "core_preserving"
+  intensity_match: "histogram"

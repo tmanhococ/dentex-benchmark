@@ -1,0 +1,9 @@
+_base_: base.yaml
+run_name: "E1_rfs"
+mode: "none"
+sampling:
+  rfs:
+    enabled: true
+    t: 0.12
+    target_repeat:
+      periapical: 2.5

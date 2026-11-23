@@ -1,0 +1,12 @@
+_base_: base.yaml
+run_name: "E7_best_rfs"
+placement:
+  mode: "fdi_swap"
+blend:
+  mode: "core_preserving"
+sampling:
+  rfs:
+    enabled: true
+    t: 0.12
+    target_repeat:
+      periapical: 2.5

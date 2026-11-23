@@ -1,0 +1,6 @@
+_base_: base.yaml
+run_name: "E4_fdi_feather"
+placement:
+  mode: "fdi_swap"
+blend:
+  mode: "feather"
