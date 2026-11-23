@@ -106,7 +106,7 @@ def blend_images(
     if M.size > 0 and np.max(M) == 1:
         M = M * 255
 
-    is_3d = dst.ndim == 3 and dst.shape[2] > 1
+    is_3d = (dst.ndim == 3)
 
     if mode == "hard":
         alpha = (M > 0)[:, :, None].astype(np.float32) if is_3d else (M > 0).astype(np.float32)
@@ -121,19 +121,42 @@ def blend_images(
         return np.clip(out, 0, 255).astype(dst.dtype)
 
     elif mode in ("poisson_normal", "poisson_mixed"):
-        ys, xs = np.where(M > 0)
-        if len(xs) == 0:
+        rx, ry, rw, rh = cv2.boundingRect(M)
+        if rw == 0 or rh == 0:
             return dst.copy()
-        center = (int(np.mean(xs)), int(np.mean(ys)))
+        center = (rx + rw // 2, ry + rh // 2)
+
         # Pad 2px to avoid border touch error in seamlessClone
         p_src = cv2.copyMakeBorder(src, 2, 2, 2, 2, cv2.BORDER_REFLECT)
         p_dst = cv2.copyMakeBorder(dst, 2, 2, 2, 2, cv2.BORDER_REFLECT)
         p_mask = cv2.copyMakeBorder(M, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
         p_center = (center[0] + 2, center[1] + 2)
 
+        is_gray = (dst.ndim == 2)
+        is_single_ch = (dst.ndim == 3 and dst.shape[2] == 1)
+
+        if is_gray or is_single_ch:
+            p_src_2d = p_src[:, :, 0] if p_src.ndim == 3 else p_src
+            p_dst_2d = p_dst[:, :, 0] if p_dst.ndim == 3 else p_dst
+            clone_src = cv2.cvtColor(p_src_2d, cv2.COLOR_GRAY2BGR)
+            clone_dst = cv2.cvtColor(p_dst_2d, cv2.COLOR_GRAY2BGR)
+        else:
+            clone_src = p_src
+            clone_dst = p_dst
+
+        if clone_src.dtype != np.uint8:
+            clone_src = np.clip(clone_src, 0, 255).astype(np.uint8)
+        if clone_dst.dtype != np.uint8:
+            clone_dst = np.clip(clone_dst, 0, 255).astype(np.uint8)
+
         clone_mode = cv2.NORMAL_CLONE if mode == "poisson_normal" else cv2.MIXED_CLONE
-        cloned = cv2.seamlessClone(p_src, p_dst, p_mask, p_center, clone_mode)
-        return cloned[2 : h + 2, 2 : w + 2]
+        cloned = cv2.seamlessClone(clone_src, clone_dst, p_mask, p_center, clone_mode)
+
+        if is_gray:
+            return cloned[2 : h + 2, 2 : w + 2, 0].astype(dst.dtype)
+        elif is_single_ch:
+            return cloned[2 : h + 2, 2 : w + 2, :1].astype(dst.dtype)
+        return cloned[2 : h + 2, 2 : w + 2].astype(dst.dtype)
 
     elif mode == "core_preserving":
         # 1. Erode M to create untouched core
