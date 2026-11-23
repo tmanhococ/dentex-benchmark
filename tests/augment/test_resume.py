@@ -206,3 +206,37 @@ def test_resume_already_complete_no_op(tmp_path):
     run_offline(cfg, bank=bank)
     rec_second = (tmp_path / "out_noop" / "base_seed0" / "state" / "recipes.jsonl").read_text()
     assert rec_orig == rec_second
+
+
+def test_force_overwrite_reprocesses_run(tmp_path, monkeypatch):
+    """Calling run_offline with overwrite=True re-processes images even if completed."""
+    ann_file = tmp_path / "train_ann.json"
+    _make_test_ann_file(ann_file, num_images=2)
+    bank = _make_test_bank()
+
+    cfg = load_config(
+        "configs/augment/base.yaml",
+        cli_overrides=[
+            f"paths.out_root={tmp_path / 'out_force'}",
+            f"paths.train_ann={ann_file}",
+            "offline.num_workers=1",
+            "output.save_dataset=false",
+        ],
+    )
+    run_offline(cfg, bank=bank)
+
+    from dentex_bench.augment import offline
+    orig_process = offline._process_image_variants
+    call_count = {"count": 0}
+
+    def counting_process(*args, **kwargs):
+        call_count["count"] += 1
+        return orig_process(*args, **kwargs)
+
+    monkeypatch.setattr(offline, "_process_image_variants", counting_process)
+
+    # With overwrite=True, it should re-run all images
+    cfg.output.overwrite = True
+    run_offline(cfg, bank=bank)
+    assert call_count["count"] == 2
+

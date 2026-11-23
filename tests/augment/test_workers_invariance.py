@@ -176,11 +176,12 @@ def test_augment_offline_cli_help():
     res = subprocess.run(cmd, capture_output=True, text=True)
     assert res.returncode == 0
     assert "--config" in res.stdout
+    assert "--force" in res.stdout
     assert "--set" in res.stdout
 
 
 def test_augment_offline_cli_execution(tmp_path):
-    """Verify CLI execution of scripts/augment_offline.py."""
+    """Verify CLI execution of scripts/augment_offline.py including --force."""
     out_root = tmp_path / "out_cli"
     cmd = [
         sys.executable,
@@ -196,3 +197,9 @@ def test_augment_offline_cli_execution(tmp_path):
     assert res.returncode == 0
     assert "[Offline] Augmentation complete" in res.stdout
     assert (out_root / "base_seed0" / "state" / "manifest.json").exists()
+
+    # Test with --force flag
+    cmd_force = cmd + ["--force"]
+    res_force = subprocess.run(cmd_force, capture_output=True, text=True)
+    assert res_force.returncode == 0
+    assert "[Offline] Augmentation complete" in res_force.stdout

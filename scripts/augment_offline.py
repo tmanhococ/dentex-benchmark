@@ -8,17 +8,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dentex_bench.augment.config import load_config
-from dentex_bench.augment.offline import run_offline
+from dentex_bench.augment.offline import run_offline_augmentation
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run DENTEX offline augmentation pipeline")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML configuration")
+    parser.add_argument("--force", action="store_true", help="Force overwrite existing output directory")
     parser.add_argument("--set", nargs="*", default=[], help="CLI overrides, e.g. paths.out_root=... offline.num_workers=2")
     args = parser.parse_args()
 
-    cfg = load_config(args.config, cli_overrides=args.set)
-    run_dir = run_offline(cfg)
+    overrides = list(args.set)
+    if args.force:
+        overrides.append("output.overwrite=true")
+
+    cfg = load_config(args.config, cli_overrides=overrides)
+    if args.force:
+        cfg.output.overwrite = True
+
+    run_dir = run_offline_augmentation(cfg)
     manifest_path = Path(run_dir) / "state" / "manifest.json"
 
     print(f"[Offline] Augmentation complete for run {cfg.run_name}")

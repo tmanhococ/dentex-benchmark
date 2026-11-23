@@ -191,7 +191,7 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
 
     # 4. Load already-completed recipes for resume
     saved_recipes_by_id: Dict[str, Dict[str, Any]] = {}
-    if recipes_file.is_file():
+    if recipes_file.is_file() and not cfg.output.overwrite:
         with open(recipes_file, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
@@ -316,3 +316,14 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
     update_progress(run_dir, last_done_index=final_done_idx, status="complete")
 
     return run_dir
+
+
+# Alias as specified by the implementation plan
+run_offline_augmentation = run_offline
+
+__all__ = [
+    "run_offline",
+    "run_offline_augmentation",
+    "_process_image_variants",
+]
+
