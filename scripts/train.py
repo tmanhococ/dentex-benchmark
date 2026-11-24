@@ -7,6 +7,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+import cv2
+cv2.setNumThreads(0)
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 from torch.utils.data import DataLoader
 
 # Add project root so it runs standalone
@@ -48,6 +54,7 @@ def parse_args(args=None):
     parser.add_argument("--train-ann", type=str, default=None, help="Path to custom training annotations file (e.g. offline augmented COCO JSON)")
     parser.add_argument("--resume", action="store_true", help="Resume from last.pth if found in output directory")
     parser.add_argument("--eval-interval", type=int, default=1, help="Run validation evaluation every N epochs")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers (0 avoids fork deadlock)")
     return parser.parse_args(args)
 
 
@@ -131,6 +138,8 @@ def main(args=None):
         cfg.gradient_accumulation_steps = max(1, 16 // max(1, cfg.batch_size))
     if args.lr is not None:
         cfg.learning_rate = args.lr
+    if getattr(args, "num_workers", None) is not None:
+        cfg.num_workers = args.num_workers
 
     print(f"=== Starting Training: {args.model.upper()} ===")
     print(f"Device: {cfg.device} ({cfg.vram_gb} GB VRAM) | Batch size: {cfg.batch_size} (Grad Accum: {cfg.gradient_accumulation_steps})")

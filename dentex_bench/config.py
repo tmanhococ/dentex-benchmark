@@ -46,7 +46,7 @@ class BenchmarkConfig:
         batch_size = 1
         grad_accum = 16
         img_size = 800
-        num_workers = 0 if os.name == "nt" else 2
+        num_workers = 0  # Zero workers prevents Linux/Colab DataLoader deadlock with OpenCV
             
         base = Path(root_dir)
         output_dir = Path("/kaggle/working/outputs") if platform == "kaggle" else base / "outputs"
