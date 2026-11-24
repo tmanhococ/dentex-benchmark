@@ -92,7 +92,15 @@ def classical_mask(img_crop: np.ndarray, bbox: Optional[List[float]] = None) -> 
 
     Returns clean binary uint8 mask (0 or 255).
     """
-    # 0. Handle grayscale/color and type normalization
+    # 0. Handle empty or degenerate crops safely
+    if img_crop is None or img_crop.size == 0:
+        return np.zeros((10, 10), dtype=np.uint8)
+    if img_crop.ndim < 2 or img_crop.shape[0] < 5 or img_crop.shape[1] < 5:
+        h = max(1, img_crop.shape[0]) if img_crop.ndim >= 1 else 10
+        w = max(1, img_crop.shape[1]) if img_crop.ndim >= 2 else 10
+        return np.zeros((h, w), dtype=np.uint8)
+
+    # Handle grayscale/color and type normalization
     if img_crop.ndim == 3:
         if img_crop.shape[2] == 4:
             gray = cv2.cvtColor(img_crop, cv2.COLOR_RGBA2GRAY)

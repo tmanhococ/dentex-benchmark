@@ -295,19 +295,222 @@ plt.show()
 
     # Cell 5: Tooth Bank Extraction
     md("## 🦷 Cell 5: Trích Xuất Tooth Bank (Các Răng Bệnh Lý & Masks Phân Đoạn)")
-    code("""from scripts.build_bank import main as build_bank_main
-import cv2
+    code("""import json, os, shutil, cv2
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-print('⚙️ Đang trích xuất Tooth Bank từ tập huấn luyện (Tuân thủ INV-1: zero val leakage)...')
-build_bank_main([
-    '--config', 'configs/augment/base.yaml',
-    '--train-ann', 'data/processed/instances_train.json',
-    '--output', 'outputs/augment/bank',
-    '--overwrite'
-])
+from dentex_bench.augment.config import load_config, ROIConfig
+from dentex_bench.augment.bank import ToothBank, ToothEntry
+from dentex_bench.augment.fdi import is_upper
+from dentex_bench.augment.masks import (
+    polygon_to_mask,
+    create_class_roi,
+    compute_ring_mask,
+    classical_mask,
+)
+from dentex_bench.augment.io_utils import (
+    read_image_lossless,
+    write_image_lossless,
+)
+
+CAT_ID_TO_ROI_CLASS = {
+    1: 'caries',
+    2: 'deep_caries',
+    3: 'periapical',
+    4: 'impacted',
+}
+
+def safe_infer_fdi(ann, img_w, img_h):
+    if 'fdi' in ann and ann['fdi'] is not None:
+        return int(ann['fdi'])
+    q = ann.get('category_id_1')
+    t = ann.get('category_id_2')
+    if q is not None and t is not None:
+        if q in (1, 2, 3, 4) and t in range(1, 9): return q * 10 + t
+        elif q in (0, 1, 2, 3) and t in range(0, 8): return (q + 1) * 10 + (t + 1)
+    bx, by, bw, bh = ann.get('bbox', [0, 0, 10, 10])
+    cx, cy = bx + bw / 2.0, by + bh / 2.0
+    cat_id = ann.get('category_id', 1)
+    is_upper_jaw = (cy < img_h / 2.0)
+    is_patient_right = (cx < img_w / 2.0)
+    if cat_id == 4:
+        return 18 if (is_upper_jaw and is_patient_right) else (28 if is_upper_jaw else (48 if is_patient_right else 38))
+    quad = (1 if is_patient_right else 2) if is_upper_jaw else (4 if is_patient_right else 3)
+    dist = abs(cx - img_w / 2.0) / max(1.0, img_w / 2.0)
+    pos = max(1, min(7, int(round(dist * 7)) + 1))
+    return quad * 10 + pos
+
+def safe_classical_mask(img_crop, bbox=None):
+    if img_crop is None or img_crop.size == 0 or img_crop.shape[0] < 5 or img_crop.shape[1] < 5:
+        h = max(1, img_crop.shape[0]) if (img_crop is not None and img_crop.ndim >= 1) else 10
+        w = max(1, img_crop.shape[1]) if (img_crop is not None and img_crop.ndim >= 2) else 10
+        return np.zeros((h, w), dtype=np.uint8)
+    try:
+        return classical_mask(img_crop, bbox=bbox)
+    except Exception:
+        h, w = img_crop.shape[:2]
+        return np.zeros((h, w), dtype=np.uint8)
+
+def robust_build_bank(cfg_path='configs/augment/base.yaml', train_ann='data/processed/instances_train.json', out_bank_dir='outputs/augment/bank'):
+    print('⚙️ Đang trích xuất Tooth Bank từ tập huấn luyện (Tuân thủ INV-1: zero val leakage)...')
+    cfg = load_config(cfg_path)
+    train_ann_path = Path(train_ann)
+    val_ann_path = Path(cfg.paths.val_ann)
+    img_dir = Path(cfg.paths.img_dir)
+    bank_dir = Path(out_bank_dir)
+
+    if not train_ann_path.exists():
+        raise FileNotFoundError(f'Training annotations not found at: {train_ann_path}')
+
+    with open(train_ann_path, 'r', encoding='utf-8') as f:
+        train_coco = json.load(f)
+
+    # Invariant 1: Assert zero validation leakage
+    train_ids = {img['id'] for img in train_coco.get('images', [])}
+    if val_ann_path.exists():
+        with open(val_ann_path, 'r', encoding='utf-8') as f:
+            val_coco = json.load(f)
+        val_ids = {img['id'] for img in val_coco.get('images', [])}
+        ToothBank.assert_no_val_leakage(train_ids, val_ids)
+
+    patches_dir = bank_dir / 'patches'
+    masks_dir = bank_dir / 'masks'
+    patches_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+
+    images_by_id = {img['id']: img for img in train_coco.get('images', [])}
+    annotations_by_img = {}
+    for ann in train_coco.get('annotations', []):
+        annotations_by_img.setdefault(ann['image_id'], []).append(ann)
+
+    entries = []
+    roi_cfg = cfg.bank.roi if hasattr(cfg, 'bank') and hasattr(cfg.bank, 'roi') else ROIConfig()
+
+    for img_id, img_info in images_by_id.items():
+        file_name = img_info['file_name']
+        candidate_paths = [
+            img_dir / file_name,
+            Path('data/raw') / Path(file_name).name,
+            Path('data/raw') / file_name,
+            Path('data') / file_name,
+        ]
+        img_path = next((p for p in candidate_paths if p.is_file()), None)
+        if img_path is None:
+            continue
+
+        img = read_image_lossless(img_path)
+        img_h, img_w = img.shape[:2]
+        anns = annotations_by_img.get(img_id, [])
+
+        for idx, ann in enumerate(anns):
+            cat_id = ann.get('category_id', 1)
+            roi_class = CAT_ID_TO_ROI_CLASS.get(cat_id, 'caries')
+            cat_name = roi_class
+
+            bx, by, bw, bh = ann.get('bbox', [0, 0, 10, 10])
+            bx, by, bw, bh = float(bx), float(by), float(bw), float(bh)
+
+            # Bỏ qua bounding box suy biến hoặc kích thước không hợp lệ
+            if bw < 5 or bh < 5 or bx + bw <= 0 or by + bh <= 0 or bx >= img_w or by >= img_h:
+                continue
+
+            fdi = safe_infer_fdi(ann, img_w, img_h)
+
+            pad_x = max(1.0, bw * 0.2)
+            pad_y = max(1.0, bh * 0.2)
+            rx1 = max(0, min(img_w - 5, int(bx - pad_x)))
+            ry1 = max(0, min(img_h - 5, int(by - pad_y)))
+            rx2 = min(img_w, max(rx1 + 5, int(bx + bw + pad_x)))
+            ry2 = min(img_h, max(ry1 + 5, int(by + bh + pad_y)))
+            rw = rx2 - rx1
+            rh = ry2 - ry1
+
+            patch = img[ry1:ry2, rx1:rx2].copy()
+            if patch is None or patch.size == 0 or patch.shape[0] < 5 or patch.shape[1] < 5:
+                continue
+            roi_xywh = [rx1, ry1, rw, rh]
+
+            # Tạo tooth mask an toàn
+            rel_box = [bx - rx1, by - ry1, bw, bh]
+            seg = ann.get('segmentation')
+            if seg and isinstance(seg, list) and len(seg) > 0 and len(seg[0]) >= 6:
+                shifted_seg = []
+                for poly in seg:
+                    pts = np.array(poly).reshape(-1, 2)
+                    pts[:, 0] -= rx1
+                    pts[:, 1] -= ry1
+                    shifted_seg.append(pts.flatten().tolist())
+                tooth_mask = polygon_to_mask(shifted_seg, rh, rw)
+                mask_source = 'polygon'
+            else:
+                tooth_mask = safe_classical_mask(patch, bbox=rel_box)
+                mask_source = 'classical'
+
+            if tooth_mask is None or tooth_mask.size == 0:
+                tooth_mask = np.zeros((rh, rw), dtype=np.uint8)
+
+            p_box = rel_box if roi_class == 'periapical' else None
+            roi_mask = create_class_roi(tooth_mask, roi_class, p_box, roi_cfg)
+            if roi_mask is None or roi_mask.size == 0:
+                roi_mask = tooth_mask.copy()
+
+            ring_mask = compute_ring_mask(roi_mask, ring_width_px=15)
+            if np.any(ring_mask > 0):
+                gray_patch = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY) if (patch.ndim == 3 and patch.shape[2] in (3, 4)) else patch
+                ring_pixels = gray_patch[ring_mask > 0]
+                ring_stats = {'mean': float(np.mean(ring_pixels)), 'std': float(np.std(ring_pixels))}
+            else:
+                ring_stats = {'mean': 128.0, 'std': 20.0}
+
+            entry_id = f'{img_id}_{fdi}_{idx}'
+            rel_patch_path = f'patches/{entry_id}.png'
+            rel_mask_path = f'masks/{entry_id}_tooth.png'
+            rel_roi_mask_path = f'masks/{entry_id}_roi.png'
+
+            write_image_lossless(bank_dir / rel_patch_path, patch)
+            write_image_lossless(bank_dir / rel_mask_path, tooth_mask)
+            write_image_lossless(bank_dir / rel_roi_mask_path, roi_mask)
+
+            local_ann = dict(ann)
+            local_ann['bbox'] = rel_box
+
+            entry = ToothEntry(
+                entry_id=entry_id,
+                image_id=img_id,
+                file_name=file_name,
+                fdi=fdi,
+                is_upper=is_upper(fdi),
+                labels=[cat_name.lower()],
+                is_healthy=(cat_id not in (1, 2, 3, 4)),
+                roi_class=roi_class,
+                bbox_xywh=[bx, by, bw, bh],
+                roi_xywh=roi_xywh,
+                annotations=[local_ann],
+                axis_angle_deg=0.0,
+                mask_area_px=int(np.sum(tooth_mask > 0)),
+                mask_h=float(bh),
+                mask_w=float(bw),
+                ring_stats=ring_stats,
+                noise_sigma=1.0,
+                patch_path=rel_patch_path,
+                mask_path=rel_mask_path,
+                roi_mask_path=rel_roi_mask_path,
+                mask_source=mask_source,
+                healthy_score=None,
+            )
+            entries.append(entry)
+
+    bank = ToothBank(entries)
+    bank.save(bank_dir)
+    print(f'✅ Đã trích xuất thành công {len(entries)} răng bệnh lý vào Tooth Bank ({bank_dir})')
+    return bank
+
+bank = robust_build_bank(
+    cfg_path='configs/augment/base.yaml',
+    train_ann='data/processed/instances_train.json',
+    out_bank_dir='outputs/augment/bank'
+)
 
 bank_dir = Path('outputs/augment/bank')
 bank_idx_p = bank_dir / 'bank_index.jsonl'
@@ -316,8 +519,6 @@ if bank_idx_p.exists():
     with open(bank_idx_p, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip(): bank_items.append(json.loads(line))
-
-print(f'✅ Đã trích xuất thành công {len(bank_items)} răng bệnh lý vào Tooth Bank.')
 
 # Trực quan hóa một số răng mẫu và mask Otsu GrabCut
 valid_show = []
@@ -338,7 +539,7 @@ if valid_show:
     for col_idx, (item, p_img, m_img) in enumerate(valid_show):
         lbl = item.get('roi_class') or (item.get('labels', ['Tooth'])[0] if item.get('labels') else 'Tooth')
         axes[0, col_idx].imshow(cv2.cvtColor(p_img, cv2.COLOR_BGR2RGB))
-        axes[0, col_idx].set_title(f\"FDI: {item.get('fdi', '')}\\n({lbl.upper()})\")
+        axes[0, col_idx].set_title(f"FDI: {item.get('fdi', '')}\\n({lbl.upper()})")
         axes[0, col_idx].axis('off')
         
         axes[1, col_idx].imshow(m_img, cmap='gray')

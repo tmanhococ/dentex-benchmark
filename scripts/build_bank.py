@@ -137,17 +137,23 @@ def build_bank_from_config(cfg_path: Optional[str] = None, out_bank_dir: Optiona
             bx, by, bw, bh = ann.get("bbox", [0, 0, 10, 10])
             bx, by, bw, bh = float(bx), float(by), float(bw), float(bh)
 
+            # Skip degenerate or out-of-bounds bounding boxes
+            if bw < 5 or bh < 5 or bx + bw <= 0 or by + bh <= 0 or bx >= img_w or by >= img_h:
+                continue
+
             # 20% margin for ROI crop
-            pad_x = bw * 0.2
-            pad_y = bh * 0.2
-            rx1 = max(0, int(bx - pad_x))
-            ry1 = max(0, int(by - pad_y))
-            rx2 = min(img_w, int(bx + bw + pad_x))
-            ry2 = min(img_h, int(by + bh + pad_y))
-            rw = max(1, rx2 - rx1)
-            rh = max(1, ry2 - ry1)
+            pad_x = max(1.0, bw * 0.2)
+            pad_y = max(1.0, bh * 0.2)
+            rx1 = max(0, min(img_w - 5, int(bx - pad_x)))
+            ry1 = max(0, min(img_h - 5, int(by - pad_y)))
+            rx2 = min(img_w, max(rx1 + 5, int(bx + bw + pad_x)))
+            ry2 = min(img_h, max(ry1 + 5, int(by + bh + pad_y)))
+            rw = rx2 - rx1
+            rh = ry2 - ry1
 
             patch = img[ry1:ry2, rx1:rx2].copy()
+            if patch is None or patch.size == 0 or patch.shape[0] < 5 or patch.shape[1] < 5:
+                continue
             roi_xywh = [rx1, ry1, rw, rh]
 
             # Generate tooth mask
@@ -166,14 +172,19 @@ def build_bank_from_config(cfg_path: Optional[str] = None, out_bank_dir: Optiona
                 tooth_mask = classical_mask(patch, bbox=rel_box)
                 mask_source = "classical"
 
+            if tooth_mask is None or tooth_mask.size == 0:
+                tooth_mask = np.zeros((rh, rw), dtype=np.uint8)
+
             # Create class ROI mask
             p_box = rel_box if roi_class == "periapical" else None
             roi_mask = create_class_roi(tooth_mask, roi_class, p_box, roi_cfg)
+            if roi_mask is None or roi_mask.size == 0:
+                roi_mask = tooth_mask.copy()
 
             # Ring statistics
             ring_mask = compute_ring_mask(roi_mask, ring_width_px=15)
             if np.any(ring_mask > 0):
-                gray_patch = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY) if patch.ndim == 3 else patch
+                gray_patch = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY) if (patch.ndim == 3 and patch.shape[2] in (3, 4)) else patch
                 ring_pixels = gray_patch[ring_mask > 0]
                 ring_stats = {"mean": float(np.mean(ring_pixels)), "std": float(np.std(ring_pixels))}
             else:
