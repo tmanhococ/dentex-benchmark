@@ -896,36 +896,56 @@ for host_file, syn_file, rec in all_pairs:
 """)
 
     # Cell 7: Train Baseline & Augmented
-    md("## 🏋️ Cell 7: Huấn Luyện Cả 2 Mô Hình: Baseline vs Augmented (30 Epochs)")
-    code("""import subprocess, shutil
+    md("## 🏋️ Cell 7: Huấn Luyện Cả 2 Mô Hình: Baseline vs Augmented (Realtime Progress & Tối Ưu Tốc Độ)")
+    code("""import subprocess, shutil, os, sys
+from pathlib import Path
+
+# Cấu hình tối ưu tốc độ cho T4 GPU
+TRAIN_BATCH_SIZE = BATCH_SIZE if 'BATCH_SIZE' in globals() and BATCH_SIZE >= 2 else 4
+EVAL_INTERVAL = 2  # Đánh giá validation mỗi 2 epochs (tiết kiệm 50% thời gian)
 
 print(f'=============================================================')
 print(f'🏋️ HUẤN LUYỆN BENCHMARK: {MODEL_TYPE.upper()} ({EPOCHS} EPOCHS)')
+print(f'⚡ Tối ưu GPU T4: Batch Size = {TRAIN_BATCH_SIZE} | Đánh giá Val mỗi {EVAL_INTERVAL} epochs')
 print(f'=============================================================')
+
+train_env = os.environ.copy()
+train_env['PYTHONUNBUFFERED'] = '1'
 
 # 1. Huấn luyện Baseline
 baseline_out = Path('outputs/benchmark_runs/baseline') / MODEL_TYPE
-print(f'\\n[1/2] Đang huấn luyện BASELINE {MODEL_TYPE} ...')
-subprocess.run([
-    sys.executable, 'scripts/train.py',
-    '--model', MODEL_TYPE,
-    '--epochs', str(EPOCHS),
-    '--lr', str(LEARNING_RATE),
-    '--output_dir', 'outputs/benchmark_runs/baseline'
-], check=True)
+baseline_done = (baseline_out / 'best.pth').is_file() and (baseline_out / 'history.json').is_file()
+
+if baseline_done:
+    print(f'\\n✅ BASELINE {MODEL_TYPE} đã có checkpoint hoàn tất. Bỏ qua và chuyển sang Augmented.')
+else:
+    print(f'\\n[1/2] Đang huấn luyện BASELINE {MODEL_TYPE} (Tiến trình realtime)...')
+    subprocess.run([
+        sys.executable, '-u', 'scripts/train.py',
+        '--model', MODEL_TYPE,
+        '--epochs', str(EPOCHS),
+        '--batch-size', str(TRAIN_BATCH_SIZE),
+        '--lr', str(LEARNING_RATE),
+        '--eval-interval', str(EVAL_INTERVAL),
+        '--resume',
+        '--output_dir', 'outputs/benchmark_runs/baseline'
+    ], env=train_env, check=True)
 
 # 2. Huấn luyện Augmented
 augmented_out = Path('outputs/benchmark_runs/augmented') / MODEL_TYPE
 print(f'\\n[2/2] Đang huấn luyện AUGMENTED {MODEL_TYPE} (với tập dữ liệu răng ghép) ...')
 aug_train_ann = Path('outputs/augment') / f'base_seed{SEED}' / 'dataset/coco/instances_train_aug.json'
 subprocess.run([
-    sys.executable, 'scripts/train.py',
+    sys.executable, '-u', 'scripts/train.py',
     '--model', MODEL_TYPE,
     '--epochs', str(EPOCHS),
+    '--batch-size', str(TRAIN_BATCH_SIZE),
     '--lr', str(LEARNING_RATE),
+    '--eval-interval', str(EVAL_INTERVAL),
     '--train-ann', str(aug_train_ann),
+    '--resume',
     '--output_dir', 'outputs/benchmark_runs/augmented'
-], check=True)
+], env=train_env, check=True)
 
 # Sao lưu checkpoint về Google Drive an toàn
 if (IN_COLAB or Path(DRIVE_OUTPUT_DIR).exists()) and Path('outputs/benchmark_runs').exists():

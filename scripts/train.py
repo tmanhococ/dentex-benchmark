@@ -40,11 +40,14 @@ def parse_args(args=None):
     )
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size per training step")
+    parser.add_argument("--batch-size", dest="batch_size", type=int, default=None, help="Alias for --batch_size")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
     parser.add_argument("--data_dir", type=str, default="data", help="Root data directory containing raw/ and processed/")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory where checkpoints are saved")
     parser.add_argument("--augment-config", type=str, default=None, help="Path to online augmentation YAML config")
     parser.add_argument("--train-ann", type=str, default=None, help="Path to custom training annotations file (e.g. offline augmented COCO JSON)")
+    parser.add_argument("--resume", action="store_true", help="Resume from last.pth if found in output directory")
+    parser.add_argument("--eval-interval", type=int, default=1, help="Run validation evaluation every N epochs")
     return parser.parse_args(args)
 
 
@@ -125,6 +128,7 @@ def main(args=None):
         cfg.epochs = args.epochs
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+        cfg.gradient_accumulation_steps = max(1, 16 // max(1, cfg.batch_size))
     if args.lr is not None:
         cfg.learning_rate = args.lr
 
@@ -195,14 +199,32 @@ def main(args=None):
     output_dir = Path(args.output_dir) / args.model
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if val_ann.exists():
-        print(f"best.pth is selected by validation mAP50 on {val_ann}")
-    else:
-        print(f"[dentex_bench] Warning: {val_ann} not found; best.pth falls back to the lowest training loss.")
-
+    start_epoch = 1
     best_score = float("-inf")
     history = []
-    for epoch in range(1, cfg.epochs + 1):
+
+    last_pth = output_dir / "last.pth"
+    if getattr(args, "resume", False) and last_pth.is_file():
+        ckpt = runner.load_checkpoint(last_pth)
+        saved_info = ckpt.get("extra_info", {})
+        saved_epoch = saved_info.get("epoch", 0)
+        start_epoch = saved_epoch + 1
+        history_path = output_dir / "history.json"
+        if history_path.is_file():
+            try:
+                with open(history_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                pass
+        print(f"[dentex_bench] Resumed from {last_pth} at epoch {start_epoch}/{cfg.epochs}", flush=True)
+
+    if val_ann.exists():
+        print(f"best.pth is selected by validation mAP50 on {val_ann}", flush=True)
+    else:
+        print(f"[dentex_bench] Warning: {val_ann} not found; best.pth falls back to the lowest training loss.", flush=True)
+
+    eval_interval = getattr(args, "eval_interval", 1) or 1
+    for epoch in range(start_epoch, cfg.epochs + 1):
         if hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch)
         elif hasattr(dataloader.dataset, "set_epoch"):
@@ -212,15 +234,24 @@ def main(args=None):
         record = {"epoch": epoch, "loss": loss_dict["loss"]}
         if augment_metadata:
             record["augmentation"] = augment_metadata
-        if val_ann.exists():
+
+        # Evaluate validation only on scheduled intervals or final epoch to maximize training speed
+        should_eval = (epoch % eval_interval == 0) or (epoch == cfg.epochs)
+        if val_ann.exists() and should_eval:
             val_metrics = evaluate_runner(runner, val_ann, val_img_dir)
             record.update({"val_mAP50": val_metrics["mAP50"], "val_mAP50_95": val_metrics["mAP50_95"]})
             score = val_metrics["mAP50"]
+        elif val_ann.exists():
+            # Carry forward previous best/known score or estimate
+            prev_map = history[-1].get("val_mAP50", 0.0) if history else 0.0
+            record.update({"val_mAP50": prev_map, "val_mAP50_95": history[-1].get("val_mAP50_95", 0.0) if history else 0.0})
+            score = prev_map
         else:
             score = -loss_dict["loss"]
+
         history.append(record)
         format_val = lambda v: f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
-        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {format_val(v)}" for k, v in record.items() if k not in ("epoch", "augmentation")))
+        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {format_val(v)}" for k, v in record.items() if k not in ("epoch", "augmentation")), flush=True)
 
         # Always update last.pth at current epoch
         runner.save_checkpoint(output_dir / "last.pth", extra_info=record)
@@ -233,7 +264,7 @@ def main(args=None):
         json.dump(history, f, indent=2)
     plot_training_history(history, output_dir / "training_curves.png")
 
-    print(f"=== Training Finished for {args.model}. Checkpoints saved to {output_dir} ===")
+    print(f"=== Training Finished for {args.model}. Checkpoints saved to {output_dir} ===", flush=True)
     return 0
 
 

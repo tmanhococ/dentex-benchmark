@@ -109,7 +109,12 @@ def predict_dataset(runner, ann_file: Union[str, Path], img_dir: Union[str, Path
 
     dataset = DentexDataset(img_dir=img_dir, ann_file=ann_file, resize=False)
     predictions, latencies = [], []
-    for idx in range(len(dataset)):
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(range(len(dataset)), desc="  Validating (mAP)", leave=False, dynamic_ncols=True)
+    except ImportError:
+        pbar = range(len(dataset))
+    for idx in pbar:
         img, target = dataset[idx]
         if torch.cuda.is_available():
             torch.cuda.synchronize()

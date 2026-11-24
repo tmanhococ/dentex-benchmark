@@ -63,7 +63,13 @@ class BaseDetectorRunner(ABC):
         accum_steps = max(1, self.config.gradient_accumulation_steps)
         total_loss, step = 0.0, 0
 
-        for images, targets in dataloader:
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(dataloader, desc="  Training", leave=False, dynamic_ncols=True)
+        except ImportError:
+            pbar = dataloader
+
+        for images, targets in pbar:
             images = [img.to(self.device) for img in images]
             targets = [
                 {"boxes": t["boxes"].to(self.device).float().reshape(-1, 4), "labels": t["labels"].to(self.device).long()}
@@ -74,6 +80,8 @@ class BaseDetectorRunner(ABC):
             self.scaler.scale(loss / accum_steps).backward()
             total_loss += float(loss.detach())
             step += 1
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix({"loss": f"{float(loss.detach()):.4f}"})
             if step % accum_steps == 0:
                 self._optimizer_step()
 

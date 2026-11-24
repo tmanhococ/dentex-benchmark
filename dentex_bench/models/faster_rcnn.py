@@ -32,7 +32,13 @@ class FasterRCNNRunner(BaseDetectorRunner):
         step = 0
         total_batches = len(dataloader) if hasattr(dataloader, "__len__") else None
 
-        for images, targets in dataloader:
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(dataloader, desc=f"  Epoch {epoch:02d} [Train]", leave=False, dynamic_ncols=True)
+        except ImportError:
+            pbar = dataloader
+
+        for images, targets in pbar:
             images = [img.to(self.device) for img in images]
             targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
 
@@ -56,6 +62,8 @@ class FasterRCNNRunner(BaseDetectorRunner):
                 self.optimizer.zero_grad()
 
             total_loss += loss_val
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
         if total_batches is None and accum_steps > 1 and step % accum_steps != 0:
             self.scaler.step(self.optimizer)
