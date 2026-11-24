@@ -701,6 +701,200 @@ for p_idx, rec in enumerate(display_pairs, 1):
     plt.show()
 """)
 
+    # Cell 6.1: Display K pairs of before & after augmentation
+    md("## 🖼️ Cell 6.1: Hiển Thị K Cặp Ảnh So Sánh Trước & Sau Khi Tăng Cường (Mặc định K = 10)")
+    code("""import json, cv2
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ==============================================================================
+# ⚙️ CẤU HÌNH SỐ LƯỢNG CẶP ẢNH MUỐN HIỂN THỊ
+# ==============================================================================
+K_PAIRS = 10  # Số lượng cặp ảnh Trước/Sau muốn hiển thị (có thể sửa thành 5, 10, 15...)
+CLASS_NAMES = {1: 'Caries', 2: 'Deep Caries', 3: 'Periapical', 4: 'Impacted'}
+
+# 1. Xác định đường dẫn thư mục kết quả an toàn
+if 'run_dir' not in globals() or not Path(str(run_dir)).exists():
+    candidate_runs = sorted(Path('outputs/augment').glob('base_seed*'))
+    if candidate_runs:
+        run_dir = candidate_runs[-1]
+    elif Path('outputs/augment').exists():
+        run_dir = Path('outputs/augment')
+    elif 'DRIVE_OUTPUT_DIR' in globals() and (Path(DRIVE_OUTPUT_DIR) / 'augmented_data').exists():
+        run_dir = Path(DRIVE_OUTPUT_DIR) / 'augmented_data'
+    else:
+        run_dir = Path('outputs/augment')
+
+# 2. Nạp COCO Annotations đã augment nếu chưa có trong bộ nhớ
+if 'aug_coco' not in globals() or aug_coco is None:
+    aug_coco_candidates = [
+        run_dir / 'dataset/coco/instances_train_aug.json',
+        run_dir / 'dataset/coco/instances.json',
+        Path('outputs/augment/dataset/coco/instances_train_aug.json'),
+    ]
+    if 'DRIVE_OUTPUT_DIR' in globals():
+        aug_coco_candidates.append(Path(DRIVE_OUTPUT_DIR) / 'augmented_data/dataset/coco/instances_train_aug.json')
+    aug_coco_p = next((p for p in aug_coco_candidates if p.is_file()), None)
+    if aug_coco_p:
+        with open(aug_coco_p, 'r', encoding='utf-8') as f:
+            aug_coco = json.load(f)
+    else:
+        raise FileNotFoundError("❌ Không tìm thấy file nhãn COCO instances_train_aug.json. Hãy chắc chắn Cell 6 đã chạy xong.")
+
+# 3. Thu thập danh sách các cặp ảnh (Gốc -> Ghép)
+recipes_p = run_dir / 'state/recipes.jsonl'
+if not recipes_p.exists() and 'DRIVE_OUTPUT_DIR' in globals():
+    alt_p = Path(DRIVE_OUTPUT_DIR) / 'augmented_data/state/recipes.jsonl'
+    if alt_p.exists():
+        recipes_p = alt_p
+
+recipe_list = []
+if recipes_p.exists():
+    with open(recipes_p, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                recipe_list.append(json.loads(line))
+
+all_pairs = []
+if recipe_list:
+    for rec in recipe_list:
+        host_file = rec.get('target_file')
+        rec_id = rec.get('recipe_id', '')
+        tokens = rec_id.replace('rec_', '').split('_')
+        syn_file = f'syn_{tokens[0]}_{tokens[1]}.png' if len(tokens) >= 2 else None
+        if host_file and syn_file:
+            all_pairs.append((host_file, syn_file, rec))
+else:
+    # Fallback tự động ghép cặp theo tên file trong COCO
+    syn_imgs = [im for im in aug_coco.get('images', []) if im['file_name'].startswith('syn_')]
+    for s_im in syn_imgs:
+        syn_fn = s_im['file_name']
+        parts = syn_fn.replace('syn_', '').replace('.png', '').split('_')
+        if len(parts) >= 1:
+            try:
+                orig_id = int(parts[0])
+                orig_im = next((im for im in aug_coco['images'] if im['id'] == orig_id), None)
+                if orig_im:
+                    all_pairs.append((orig_im['file_name'], syn_fn, None))
+            except ValueError:
+                pass
+
+print(f"📊 Tìm thấy tổng cộng {len(all_pairs)} cặp ảnh sinh ra từ quá trình ghép răng.")
+display_count = min(K_PAIRS, len(all_pairs))
+print(f"🖼️ Đang hiển thị {display_count} cặp ảnh so sánh chi tiết trước và sau khi tăng cường...\\n")
+
+def resolve_img_path(fn):
+    candidates = [
+        run_dir / 'dataset/images' / fn,
+        run_dir / 'synthetic' / fn,
+        Path('data/raw') / fn,
+        Path('data/processed') / fn,
+        Path('data') / fn,
+    ]
+    if 'DRIVE_DATA_DIR' in globals():
+        candidates.append(Path(DRIVE_DATA_DIR) / fn)
+    if 'DRIVE_OUTPUT_DIR' in globals():
+        candidates.append(Path(DRIVE_OUTPUT_DIR) / 'augmented_data/dataset/images' / fn)
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+shown_idx = 0
+for host_file, syn_file, rec in all_pairs:
+    if shown_idx >= K_PAIRS:
+        break
+
+    host_path = resolve_img_path(host_file)
+    syn_path = resolve_img_path(syn_file)
+
+    if not host_path or not syn_path:
+        continue
+
+    img_orig = cv2.imread(str(host_path))
+    img_syn = cv2.imread(str(syn_path))
+    if img_orig is None or img_syn is None:
+        continue
+
+    rgb_orig = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+    rgb_syn = cv2.cvtColor(img_syn, cv2.COLOR_BGR2RGB)
+
+    orig_im_info = next((im for im in aug_coco['images'] if im['file_name'] == host_file), None)
+    syn_im_info = next((im for im in aug_coco['images'] if im['file_name'] == syn_file), None)
+
+    orig_anns = [a for a in aug_coco['annotations'] if orig_im_info and a['image_id'] == orig_im_info['id']]
+    syn_anns = [a for a in aug_coco['annotations'] if syn_im_info and a['image_id'] == syn_im_info['id']]
+
+    # 1. Vẽ bounding boxes trên ảnh gốc (Màu xanh lá)
+    for a in orig_anns:
+        bx, by, bw, bh = [int(v) for v in a['bbox']]
+        cname = CLASS_NAMES.get(a.get('category_id'), 'Lesion')
+        cv2.rectangle(rgb_orig, (bx, by), (bx + bw, by + bh), (0, 255, 0), 3)
+        cv2.putText(rgb_orig, cname, (bx, max(20, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # 2. Vẽ bounding boxes trên ảnh sau ghép (Đỏ cho răng mới ghép, Xanh cho răng gốc)
+    swapped_anns = []
+    for a in syn_anns:
+        bx, by, bw, bh = [int(v) for v in a['bbox']]
+        is_syn = a.get('synthetic', False)
+        cname = CLASS_NAMES.get(a.get('category_id'), 'Lesion')
+        color = (255, 50, 50) if is_syn else (0, 255, 0)
+        tag = ' [GHÉP]' if is_syn else ''
+        cv2.rectangle(rgb_syn, (bx, by), (bx + bw, by + bh), color, 3)
+        cv2.putText(rgb_syn, f"{cname}{tag}", (bx, max(20, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        if is_syn:
+            swapped_anns.append(a)
+
+    shown_idx += 1
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5), gridspec_kw={'width_ratios': [3, 3, 1.5, 1.5]})
+
+    # Cột 1: Toàn cảnh ảnh gốc (Trước)
+    axes[0].imshow(rgb_orig)
+    axes[0].set_title(f'1. TRƯỚC TĂNG CƯỜNG (GỐC)\\n{host_file} (Viền Xanh: Tổn thương gốc)', fontsize=11, color='darkgreen')
+    axes[0].axis('off')
+
+    # Cột 2: Toàn cảnh ảnh synthetic (Sau)
+    axes[1].imshow(rgb_syn)
+    axes[1].set_title(f'2. SAU TĂNG CƯỜNG (GHÉP RĂNG)\\n{syn_file} (Viền Đỏ: Răng nhân tạo vừa ghép)', fontsize=11, color='darkred')
+    axes[1].axis('off')
+
+    # Cột 3 & 4: Zoom cận cảnh vị trí răng ghép
+    target_ann = swapped_anns[0] if swapped_anns else (syn_anns[0] if syn_anns else None)
+    if target_ann:
+        zx, zy, zw, zh = [int(v) for v in target_ann['bbox']]
+        pad = 40
+        h_max = min(rgb_orig.shape[0], rgb_syn.shape[0])
+        w_max = min(rgb_orig.shape[1], rgb_syn.shape[1])
+        y1, y2 = max(0, zy - pad), min(h_max, zy + zh + pad)
+        x1, x2 = max(0, zx - pad), min(w_max, zx + zw + pad)
+
+        crop_orig = rgb_orig[y1:y2, x1:x2]
+        crop_syn = rgb_syn[y1:y2, x1:x2]
+
+        axes[2].imshow(crop_orig)
+        axes[2].set_title('3. CẬN CẢNH TRƯỚC KHI GHÉP\\n(Vùng nhận răng gốc)', fontsize=10)
+        axes[2].axis('off')
+
+        axes[3].imshow(crop_syn)
+        axes[3].set_title('4. CẬN CẢNH SAU KHI GHÉP\\n(Hòa trộn Poisson viền răng)', fontsize=10)
+        axes[3].axis('off')
+    else:
+        axes[2].axis('off')
+        axes[3].axis('off')
+
+    extra_info = ''
+    if rec and 'ops' in rec and rec['ops']:
+        first_op = rec['ops'][0]
+        extra_info = f" | Răng ghép: FDI {first_op.get('target_fdi', '')} ({first_op.get('source_entry_id', '')})"
+
+    plt.suptitle(f'🦷 CẶP MẪU #{shown_idx}/{display_count}: SO SÁNH TRỰC QUAN TRƯỚC VÀ SAU KHI TĂNG CƯỜNG{extra_info}', fontsize=13, weight='bold')
+    plt.tight_layout()
+    plt.show()
+""")
+
     # Cell 7: Train Baseline & Augmented
     md("## 🏋️ Cell 7: Huấn Luyện Cả 2 Mô Hình: Baseline vs Augmented (30 Epochs)")
     code("""import subprocess, shutil
