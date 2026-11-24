@@ -30,10 +30,10 @@ def create_notebook():
     md("""# 🦷 DENTEX: Pipeline Tăng Cường Dữ Liệu Ghép Răng & Huấn Luyện Benchmark (1-Click Google Colab)
 
 Notebook này tự động hóa **toàn bộ quy trình 1-Click** từ dữ liệu X-quang răng trên Google Drive:
-1. **Nạp & Xác thực dữ liệu X-quang thật** từ thư mục Google Drive của bạn.
+1. **Nạp & Xác thực dữ liệu X-quang thật** từ thư mục Google Drive của bạn (tự động nhận diện cấu trúc thư mục, kích thước ảnh và gán nhãn giải phẫu FDI).
 2. **Khởi tạo Tooth Bank:** Trích xuất các răng sâu, răng mọc ngầm từ tập Train kèm mask phân đoạn Otsu GrabCut.
 3. **Thực hiện ghép răng (Tooth-Swap Augmentation):** Sinh ảnh X-quang tăng cường tuân thủ nghiêm ngặt 8 invariants giải phẫu nha khoa (khớp số răng FDI 1-8, bảo toàn vị trí răng khôn 8, đối xứng qua hàm đối bên, hòa trộn biên Poisson/Gaussian).
-4. **Hiển thị trực quan so sánh Trước vs Sau:** Hiển thị ảnh răng trước và sau khi ghép kèm ảnh zoom cận cảnh từng chân răng/thân răng.
+4. **Hiển thị trực quan so sánh Trước vs Sau:** Hiển thị ảnh răng trước và sau khi ghép kèm ảnh zoom cận cảnh từng chân răng/thân răng và vết ghép.
 5. **Lưu toàn bộ dữ liệu đã xử lý vào Google Drive:** Tự động sao lưu ảnh đã ghép, nhãn COCO/YOLO, Tooth Bank và file nén zip về Drive.
 6. **Huấn luyện mô hình:** Train cả 2 mô hình **Baseline** và **Augmented** (Faster R-CNN / HierarchicalNet, 20-30 epochs).
 7. **Đánh giá Benchmark chuẩn:** Đo lường các chỉ số detection chuẩn COCO ($mAP_{50}$, $mAP_{50:95}$, $AR$, per-class AP, độ trễ và VRAM).
@@ -91,16 +91,17 @@ if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
     print(f'✅ GPU: {props.name} | VRAM: {props.total_memory / (1024**3):.2f} GB | CUDA: {torch.version.cuda}')
 else:
-    print('⚠️ Cảnh báo: Không tìm thấy GPU. Hãy vào Runtime → Change runtime type → Chọn T4 GPU.')
+    print('ℹ️ Không có GPU, đang chạy trên CPU (Tự động tối ưu số bước test).')
 
 print('\\n=== 2. KẾT NỐI GOOGLE DRIVE ===')
 if IN_COLAB:
     from google.colab import drive
-    drive.mount('/content/drive')
-    print(f'✅ Google Drive đã kết nối thành công.')
+    if not Path('/content/drive/MyDrive').exists():
+        drive.mount('/content/drive')
+    print('✅ Google Drive đã kết nối thành công.')
     Path(DRIVE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 else:
-    print('ℹ️ Đang chạy ngoài Google Colab (Local environment).')
+    print('ℹ️ Đang chạy môi trường ngoài Colab (Local/Headless).')
 """)
 
     # Cell 2: Clone Repo
@@ -134,7 +135,8 @@ REQUIRED_PACKAGES = [
     'tabulate>=0.9.0',
     'scikit-image>=0.20.0',
     'scipy>=1.10.0',
-    'kaggle>=1.6.0'
+    'kaggle>=1.6.0',
+    'pillow>=9.0.0'
 ]
 
 print('📦 Đang kiểm tra và cài đặt thư viện phụ thuộc...')
@@ -149,6 +151,7 @@ print('✅ Hoàn tất cài đặt thư viện!')
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 from dentex_bench.data.parser import convert_dentex_annotations_to_coco
 
 drive_path = Path(DRIVE_DATA_DIR)
@@ -158,42 +161,57 @@ local_processed = local_data / 'processed'
 local_raw.mkdir(parents=True, exist_ok=True)
 local_processed.mkdir(parents=True, exist_ok=True)
 
-print(f'🔎 Đang quét dữ liệu từ Google Drive: {drive_path} ...')
+# 1. Tìm kiếm thông minh nếu người dùng đặt tên thư mục hơi khác trên Drive
 if not drive_path.exists():
-    raise FileNotFoundError(f'❌ Không tìm thấy thư mục {drive_path}. Hãy kiểm tra lại tên thư mục trên Google Drive của bạn.')
+    print(f'⚠️ Không tìm thấy chính xác {drive_path}, đang tìm kiếm các thư mục X-quang liên quan...')
+    candidates = []
+    if Path('/content/drive/MyDrive').exists():
+        for p in Path('/content/drive/MyDrive').iterdir():
+            if p.is_dir() and ('dentex' in p.name.lower() or 'xray' in p.name.lower() or 'dental' in p.name.lower()):
+                candidates.append(p)
+    if candidates:
+        print(f'💡 Đã tự động phát hiện thư mục dữ liệu: {candidates[0]}')
+        drive_path = candidates[0]
+    elif Path('data').exists() and (list(Path('data').glob('**/*.png')) or list(Path('data').glob('**/*.jpg'))):
+        print('💡 Sử dụng thư mục data cục bộ có sẵn: data')
+        drive_path = Path('data')
+    else:
+        raise FileNotFoundError(f'❌ Không tìm thấy thư mục {drive_path}. Hãy kiểm tra lại đường dẫn DRIVE_DATA_DIR trong Cell 0.')
 
-# Quét ảnh
-all_drive_imgs = list(drive_path.glob('**/*.png')) + list(drive_path.glob('**/*.jpg'))
-all_drive_jsons = list(drive_path.glob('**/*.json'))
+print(f'🔎 Đang quét dữ liệu từ: {drive_path} ...')
+all_drive_imgs = [p for p in drive_path.rglob('*') if p.suffix.lower() in ('.png', '.jpg', '.jpeg') and p.is_file()]
+all_drive_jsons = [p for p in drive_path.rglob('*.json') if p.is_file()]
+
 print(f'📊 Tìm thấy {len(all_drive_imgs)} file ảnh và {len(all_drive_jsons)} file JSON.')
-
 if len(all_drive_imgs) == 0:
-    raise RuntimeError(f'❌ Không tìm thấy ảnh X-quang nào trong {drive_path}. Vui lòng đặt ảnh vào thư mục.')
+    raise RuntimeError(f'❌ Không tìm thấy ảnh X-quang nào trong {drive_path}. Vui lòng kiểm tra lại đường dẫn.')
 
-# Copy ảnh sang local data/raw nếu chưa có
+# 2. Đồng bộ ảnh sang local data/raw an toàn (tránh copy cùng file)
 print('📥 Đang đồng bộ ảnh vào môi trường thực thi...')
 for img_p in all_drive_imgs:
     dest = local_raw / img_p.name
-    if not dest.exists():
+    if img_p.resolve() != dest.resolve() and not dest.exists():
         shutil.copy2(img_p, dest)
 
 train_ann_file = local_processed / 'instances_train.json'
 val_ann_file = local_processed / 'instances_val.json'
 
-# Kiểm tra nếu đã có sẵn instances_train.json trên Drive
+# 3. Phân tích hoặc nạp nhãn COCO
 existing_train = [j for j in all_drive_jsons if 'instances_train' in j.name]
 existing_val = [j for j in all_drive_jsons if 'instances_val' in j.name]
 
 if existing_train and existing_val:
     print('📦 Sử dụng các file COCO annotations có sẵn từ Drive...')
-    shutil.copy2(existing_train[0], train_ann_file)
-    shutil.copy2(existing_val[0], val_ann_file)
+    if existing_train[0].resolve() != train_ann_file.resolve():
+        shutil.copy2(existing_train[0], train_ann_file)
+    if existing_val[0].resolve() != val_ann_file.resolve():
+        shutil.copy2(existing_val[0], val_ann_file)
 else:
-    # Tự động parse từ raw DENTEX annotation json
-    raw_jsons = [j for j in all_drive_jsons if 'instances' not in j.name and j.stat().st_size > 5000]
-    if not raw_jsons:
-        raw_jsons = all_drive_jsons
-    best_ann = raw_jsons[0]
+    raw_jsons = [j for j in all_drive_jsons if 'instances' not in j.name and j.stat().st_size > 3000]
+    if not raw_jsons: raw_jsons = all_drive_jsons
+    best_ann = raw_jsons[0] if raw_jsons else None
+    if best_ann is None:
+        raise FileNotFoundError('❌ Không tìm thấy file nhãn JSON nào trong thư mục data.')
     print(f'⚙️ Tự động chuyển đổi nhãn DENTEX từ {best_ann.name} sang định dạng COCO...')
     convert_dentex_annotations_to_coco(
         raw_ann_file=best_ann,
@@ -203,22 +221,55 @@ else:
         seed=SEED
     )
 
-with open(train_ann_file, 'r', encoding='utf-8') as f:
-    train_coco = json.load(f)
-with open(val_ann_file, 'r', encoding='utf-8') as f:
-    val_coco = json.load(f)
+# 4. TỰ ĐỘNG CHUẨN HÓA KÍCH THƯỚC ẢNH & GÁN NHÃN GIẢI PHẪU FDI
+def infer_fdi_robust(ann, img_w, img_h):
+    if 'fdi' in ann and ann['fdi']: return int(ann['fdi'])
+    q = ann.get('category_id_1')
+    t = ann.get('category_id_2')
+    if q is not None and t is not None:
+        if q in (1, 2, 3, 4) and t in range(1, 9): return q * 10 + t
+        elif q in (0, 1, 2, 3) and t in range(0, 8): return (q + 1) * 10 + (t + 1)
+    bx, by, bw, bh = ann.get('bbox', [0, 0, 10, 10])
+    cx, cy = bx + bw / 2.0, by + bh / 2.0
+    is_upper, is_right = (cy < img_h / 2.0), (cx < img_w / 2.0)
+    cat_id = ann.get('category_id', 1)
+    if cat_id == 4:
+        return 18 if (is_upper and is_right) else (28 if is_upper else (48 if is_right else 38))
+    quad = (1 if is_right else 2) if is_upper else (4 if is_right else 3)
+    dist_ratio = abs(cx - img_w / 2.0) / max(1.0, img_w / 2.0)
+    pos = min(7, max(1, int(dist_ratio * 7) + 1))
+    return quad * 10 + pos
+
+for ann_path in [train_ann_file, val_ann_file]:
+    with open(ann_path, 'r', encoding='utf-8') as f:
+        coco_d = json.load(f)
+    img_map = {im['id']: im for im in coco_d.get('images', [])}
+    for im in coco_d.get('images', []):
+        r_path = local_raw / Path(im['file_name']).name
+        if r_path.is_file():
+            try:
+                with Image.open(r_path) as pimg:
+                    im['width'], im['height'] = pimg.size
+            except Exception: pass
+    for a in coco_d.get('annotations', []):
+        im_info = img_map.get(a['image_id'], {})
+        iw, ih = im_info.get('width', 1000), im_info.get('height', 500)
+        a['fdi'] = infer_fdi_robust(a, iw, ih)
+    with open(ann_path, 'w', encoding='utf-8') as f:
+        json.dump(coco_d, f, indent=2)
+
+with open(train_ann_file, 'r', encoding='utf-8') as f: train_coco = json.load(f)
+with open(val_ann_file, 'r', encoding='utf-8') as f: val_coco = json.load(f)
 
 print(f'\\n✅ XÁC THỰC DỮ LIỆU HOÀN TẤT:')
 print(f'  - Tập Train: {len(train_coco[\"images\"])} ảnh | {len(train_coco[\"annotations\"])} nhãn tổn thương.')
 print(f'  - Tập Val:   {len(val_coco[\"images\"])} ảnh | {len(val_coco[\"annotations\"])} nhãn tổn thương.')
 
-# Hiển thị trực quan 2 ảnh X-quang thật đầu tiên để xác nhận
 sample_imgs = train_coco[\"images\"][:2]
 fig, axes = plt.subplots(1, len(sample_imgs), figsize=(16, 6))
 if len(sample_imgs) == 1: axes = [axes]
 
 CLASS_NAMES = {1: 'Caries', 2: 'Deep Caries', 3: 'Periapical', 4: 'Impacted'}
-COLORS = {1: (0, 255, 0), 2: (255, 165, 0), 3: (255, 0, 0), 4: (0, 0, 255)}
 
 for ax, im_info in zip(axes, sample_imgs):
     img_path = local_raw / im_info['file_name']
@@ -226,15 +277,13 @@ for ax, im_info in zip(axes, sample_imgs):
     if img_bgr is None: continue
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h, w = img_rgb.shape[:2]
-    
-    # Vẽ bboxes
     anns = [a for a in train_coco['annotations'] if a['image_id'] == im_info['id']]
     for a in anns:
         bx, by, bw, bh = [int(v) for v in a['bbox']]
-        c_id = a['category_id']
-        c_name = CLASS_NAMES.get(c_id, str(c_id))
+        c_name = CLASS_NAMES.get(a['category_id'], str(a['category_id']))
+        fdi_tag = f\" [FDI {a.get('fdi', '')}]\" if 'fdi' in a else ''
         cv2.rectangle(img_rgb, (bx, by), (bx + bw, by + bh), (255, 255, 0), 3)
-        cv2.putText(img_rgb, c_name, (bx, max(20, by - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(img_rgb, f\"{c_name}{fdi_tag}\", (bx, max(20, by - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
     ax.imshow(img_rgb)
     ax.set_title(f\"{im_info['file_name']} ({w}x{h}) - {len(anns)} lesions\")
@@ -248,7 +297,9 @@ plt.show()
     md("## 🦷 Cell 5: Trích Xuất Tooth Bank (Các Răng Bệnh Lý & Masks Phân Đoạn)")
     code("""from scripts.build_bank import main as build_bank_main
 import cv2
+from pathlib import Path
 import matplotlib.pyplot as plt
+import numpy as np
 
 print('⚙️ Đang trích xuất Tooth Bank từ tập huấn luyện (Tuân thủ INV-1: zero val leakage)...')
 build_bank_main([
@@ -258,7 +309,8 @@ build_bank_main([
     '--overwrite'
 ])
 
-bank_idx_p = Path('outputs/augment/bank/bank_index.jsonl')
+bank_dir = Path('outputs/augment/bank')
+bank_idx_p = bank_dir / 'bank_index.jsonl'
 bank_items = []
 if bank_idx_p.exists():
     with open(bank_idx_p, 'r', encoding='utf-8') as f:
@@ -268,17 +320,25 @@ if bank_idx_p.exists():
 print(f'✅ Đã trích xuất thành công {len(bank_items)} răng bệnh lý vào Tooth Bank.')
 
 # Trực quan hóa một số răng mẫu và mask Otsu GrabCut
-if bank_items:
-    show_items = bank_items[:min(5, len(bank_items))]
-    fig, axes = plt.subplots(2, len(show_items), figsize=(15, 6))
-    if len(show_items) == 1: axes = np.expand_dims(axes, axis=1)
+valid_show = []
+for item in bank_items:
+    patch_p = bank_dir / item['patch_path'] if not Path(item['patch_path']).is_file() else Path(item['patch_path'])
+    mask_p = bank_dir / item['mask_path'] if not Path(item['mask_path']).is_file() else Path(item['mask_path'])
+    if patch_p.is_file() and mask_p.is_file():
+        p_img = cv2.imread(str(patch_p))
+        m_img = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE)
+        if p_img is not None and m_img is not None:
+            valid_show.append((item, p_img, m_img))
+    if len(valid_show) >= 5: break
+
+if valid_show:
+    fig, axes = plt.subplots(2, len(valid_show), figsize=(15, 6))
+    if len(valid_show) == 1: axes = np.expand_dims(axes, axis=1)
     
-    for col_idx, item in enumerate(show_items):
-        p_img = cv2.imread(item['patch_path'])
-        m_img = cv2.imread(item['mask_path'], cv2.IMREAD_GRAYSCALE)
-        
+    for col_idx, (item, p_img, m_img) in enumerate(valid_show):
+        lbl = item.get('roi_class') or (item.get('labels', ['Tooth'])[0] if item.get('labels') else 'Tooth')
         axes[0, col_idx].imshow(cv2.cvtColor(p_img, cv2.COLOR_BGR2RGB))
-        axes[0, col_idx].set_title(f\"FDI: {item['fdi']} | Cat: {item['category_id']}\\n({CLASS_NAMES.get(item['category_id'], 'Tooth')})\")
+        axes[0, col_idx].set_title(f\"FDI: {item.get('fdi', '')}\\n({lbl.upper()})\")
         axes[0, col_idx].axis('off')
         
         axes[1, col_idx].imshow(m_img, cmap='gray')
@@ -302,13 +362,14 @@ print(f'⚙️ Đang sinh dữ liệu ghép răng nhân tạo (seed={SEED}, n={N
 augment_offline_main([
     '--config', 'configs/augment/base.yaml',
     '--train-ann', 'data/processed/instances_train.json',
-    '--output-dir', 'outputs/augment/base_seed0',
+    '--output-dir', 'outputs/augment',
     '--seed', str(SEED),
     '--n-samples-per-image', str(NUM_AUGMENT_PER_IMAGE),
     '--overwrite'
 ])
 
-aug_coco_p = Path('outputs/augment/base_seed0/dataset/coco/instances_train_aug.json')
+run_dir = Path('outputs/augment') / f'base_seed{SEED}'
+aug_coco_p = run_dir / 'dataset/coco/instances_train_aug.json'
 with open(aug_coco_p, 'r', encoding='utf-8') as f:
     aug_coco = json.load(f)
 
@@ -325,15 +386,16 @@ if IN_COLAB or Path(DRIVE_OUTPUT_DIR).exists():
     print(f'\\n💾 Đang lưu dữ liệu đã xử lý vào Google Drive: {drive_processed_dir} ...')
     
     # 1. Lưu toàn bộ thư mục dataset (images, coco, yolo)
-    shutil.copytree('outputs/augment/base_seed0/dataset', drive_processed_dir / 'dataset', dirs_exist_ok=True)
+    if (run_dir / 'dataset').resolve() != (drive_processed_dir / 'dataset').resolve():
+        shutil.copytree(run_dir / 'dataset', drive_processed_dir / 'dataset', dirs_exist_ok=True)
     
     # 2. Lưu Tooth Bank (patches, masks, index)
-    if Path('outputs/augment/bank').exists():
+    if Path('outputs/augment/bank').exists() and Path('outputs/augment/bank').resolve() != (drive_processed_dir / 'tooth_bank').resolve():
         shutil.copytree('outputs/augment/bank', drive_processed_dir / 'tooth_bank', dirs_exist_ok=True)
         
     # 3. Lưu Provenance state (manifest.json, recipes.jsonl)
-    if Path('outputs/augment/base_seed0/state').exists():
-        shutil.copytree('outputs/augment/base_seed0/state', drive_processed_dir / 'state', dirs_exist_ok=True)
+    if (run_dir / 'state').exists() and (run_dir / 'state').resolve() != (drive_processed_dir / 'state').resolve():
+        shutil.copytree(run_dir / 'state', drive_processed_dir / 'state', dirs_exist_ok=True)
         
     all_saved = list(drive_processed_dir.glob('**/*'))
     print(f'✅ ĐÃ LƯU THÀNH CÔNG VÀO GOOGLE DRIVE: {len([f for f in all_saved if f.is_file()])} files!')
@@ -344,8 +406,7 @@ if IN_COLAB or Path(DRIVE_OUTPUT_DIR).exists():
 # ==============================================================================
 print('\\n🖼️ Đang hiển thị trực quan so sánh ảnh trước và sau khi ghép răng...')
 
-# Đọc recipes để bắt cặp chính xác ảnh gốc và ảnh synthetic
-recipes_p = Path('outputs/augment/base_seed0/state/recipes.jsonl')
+recipes_p = run_dir / 'state/recipes.jsonl'
 recipe_pairs = []
 if recipes_p.exists():
     with open(recipes_p, 'r', encoding='utf-8') as f:
@@ -354,20 +415,17 @@ if recipes_p.exists():
                 r = json.loads(line)
                 recipe_pairs.append(r)
 
-# Chọn tối đa 3 cặp để hiển thị chi tiết
 display_pairs = recipe_pairs[:min(3, len(recipe_pairs))]
-
 CLASS_NAMES = {1: 'Caries', 2: 'Deep Caries', 3: 'Periapical', 4: 'Impacted'}
 
 for p_idx, rec in enumerate(display_pairs, 1):
     host_file = rec.get('target_file')
     rec_id = rec.get('recipe_id', '')
-    # Tên file synthetic tương ứng (vd syn_1_0.png)
     tokens = rec_id.replace('rec_', '').split('_')
     syn_file = f'syn_{tokens[0]}_{tokens[1]}.png' if len(tokens) >= 2 else None
     
     host_path = Path('data/raw') / host_file if host_file else None
-    syn_path = Path('outputs/augment/base_seed0/dataset/images') / syn_file if syn_file else None
+    syn_path = run_dir / 'dataset/images' / syn_file if syn_file else None
     
     if not (host_path and host_path.exists() and syn_path and syn_path.exists()):
         continue
@@ -379,7 +437,6 @@ for p_idx, rec in enumerate(display_pairs, 1):
     rgb_orig = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
     rgb_syn = cv2.cvtColor(img_syn, cv2.COLOR_BGR2RGB)
     
-    # Tìm thông tin ảnh và annotations
     orig_im_info = next((im for im in aug_coco['images'] if im['file_name'] == host_file), None)
     syn_im_info = next((im for im in aug_coco['images'] if im['file_name'] == syn_file), None)
     
@@ -405,7 +462,6 @@ for p_idx, rec in enumerate(display_pairs, 1):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         if is_syn: swapped_anns.append(a)
         
-    # Tạo bảng hiển thị 4 cột: [Ảnh gốc toàn cảnh] | [Ảnh sau ghép toàn cảnh] | [Zoom gốc] | [Zoom sau ghép]
     fig, axes = plt.subplots(1, 4, figsize=(22, 5), gridspec_kw={'width_ratios': [3, 3, 1.5, 1.5]})
     
     # Cột 1: Toàn cảnh ảnh gốc
@@ -466,22 +522,24 @@ subprocess.run([
 # 2. Huấn luyện Augmented
 augmented_out = Path('outputs/benchmark_runs/augmented') / MODEL_TYPE
 print(f'\\n[2/2] Đang huấn luyện AUGMENTED {MODEL_TYPE} (với tập dữ liệu răng ghép) ...')
+aug_train_ann = Path('outputs/augment') / f'base_seed{SEED}' / 'dataset/coco/instances_train_aug.json'
 subprocess.run([
     sys.executable, 'scripts/train.py',
     '--model', MODEL_TYPE,
     '--epochs', str(EPOCHS),
     '--lr', str(LEARNING_RATE),
-    '--train-ann', 'outputs/augment/base_seed0/dataset/coco/instances_train_aug.json',
+    '--train-ann', str(aug_train_ann),
     '--output_dir', 'outputs/benchmark_runs/augmented'
 ], check=True)
 
-# Sao lưu checkpoint về Google Drive
-if IN_COLAB and Path(DRIVE_OUTPUT_DIR).exists():
-    print(f'\\n💾 Đang sao lưu toàn bộ checkpoints về Google Drive: {DRIVE_OUTPUT_DIR} ...')
+# Sao lưu checkpoint về Google Drive an toàn
+if (IN_COLAB or Path(DRIVE_OUTPUT_DIR).exists()) and Path('outputs/benchmark_runs').exists():
     drive_ckpts = Path(DRIVE_OUTPUT_DIR) / 'checkpoints'
-    drive_ckpts.mkdir(parents=True, exist_ok=True)
-    shutil.copytree('outputs/benchmark_runs', drive_ckpts, dirs_exist_ok=True)
-    print('✅ Sao lưu checkpoint về Google Drive hoàn tất!')
+    if Path('outputs/benchmark_runs').resolve() != drive_ckpts.resolve():
+        print(f'\\n💾 Đang sao lưu toàn bộ checkpoints về Google Drive: {DRIVE_OUTPUT_DIR} ...')
+        drive_ckpts.mkdir(parents=True, exist_ok=True)
+        shutil.copytree('outputs/benchmark_runs', drive_ckpts, dirs_exist_ok=True)
+        print('✅ Sao lưu checkpoint về Google Drive hoàn tất!')
 """)
 
     # Cell 8: Evaluate & Compare
@@ -569,15 +627,15 @@ zip_path = Path('outputs/kaggle_dataset/dentex_augmented_tooth_swap.zip')
 print(f'✅ Đã tạo gói dataset tại: {pkg_dir}')
 print(f'✅ File zip nén: {zip_path} ({zip_path.stat().st_size / (1024**2):.2f} MB)')
 
-if IN_COLAB and Path(DRIVE_OUTPUT_DIR).exists():
+if (IN_COLAB or Path(DRIVE_OUTPUT_DIR).exists()) and pkg_dir.exists():
     drive_final_dir = Path(DRIVE_OUTPUT_DIR) / 'final_dataset'
     drive_final_dir.mkdir(parents=True, exist_ok=True)
     
     print(f'\\n💾 Đang đồng bộ toàn bộ dataset đóng gói và file zip về Google Drive ({drive_final_dir})...')
-    # Copy file zip vào thư mục chính của DRIVE_OUTPUT_DIR để dễ tải về
-    shutil.copy2(zip_path, Path(DRIVE_OUTPUT_DIR) / zip_path.name)
-    # Copy thư mục dataset mở rộng
-    shutil.copytree(pkg_dir, drive_final_dir, dirs_exist_ok=True)
+    if zip_path.resolve() != (Path(DRIVE_OUTPUT_DIR) / zip_path.name).resolve():
+        shutil.copy2(zip_path, Path(DRIVE_OUTPUT_DIR) / zip_path.name)
+    if pkg_dir.resolve() != drive_final_dir.resolve():
+        shutil.copytree(pkg_dir, drive_final_dir, dirs_exist_ok=True)
     
     print('\\n=============================================================')
     print('🎉 TẤT CẢ DỮ LIỆU ĐÃ ĐƯỢC LƯU AN TOÀN TRÊN GOOGLE DRIVE:')

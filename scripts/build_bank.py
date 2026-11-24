@@ -78,9 +78,9 @@ def infer_fdi_if_missing(ann: Dict[str, Any], img_w: int, img_h: int) -> int:
     return quad * 10 + t_num
 
 
-def build_bank_from_config(cfg_path: Optional[str] = None, out_bank_dir: Optional[Path] = None) -> ToothBank:
+def build_bank_from_config(cfg_path: Optional[str] = None, out_bank_dir: Optional[Path] = None, train_ann: Optional[Path] = None) -> ToothBank:
     cfg = load_config(cfg_path or "configs/augment/base.yaml")
-    train_ann_path = Path(cfg.paths.train_ann)
+    train_ann_path = Path(train_ann) if train_ann else Path(cfg.paths.train_ann)
     val_ann_path = Path(cfg.paths.val_ann)
     img_dir = Path(cfg.paths.img_dir)
     bank_dir = out_bank_dir or (Path(cfg.paths.out_root) / "bank")
@@ -224,14 +224,18 @@ def build_bank_from_config(cfg_path: Optional[str] = None, out_bank_dir: Optiona
     return bank
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Build DENTEX Tooth and Lesion Bank")
     parser.add_argument("--config", type=str, default="configs/augment/base.yaml")
     parser.add_argument("--out", type=str, default=None, help="Output directory for tooth bank")
-    args = parser.parse_args()
+    parser.add_argument("--output", type=str, default=None, help="Alias for --out")
+    parser.add_argument("--train-ann", type=str, default=None, help="Override training annotation path")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing bank")
+    args = parser.parse_args(argv)
 
-    out_bank_dir = Path(args.out) if args.out else None
-    build_bank_from_config(args.config, out_bank_dir=out_bank_dir)
+    out_bank_dir = Path(args.output or args.out) if (args.output or args.out) else None
+    train_ann = Path(args.train_ann) if args.train_ann else None
+    build_bank_from_config(args.config, out_bank_dir=out_bank_dir, train_ann=train_ann)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,13 @@ def main():
     (dist_dir / "provenance").mkdir(parents=True, exist_ok=True)
 
     # 2. Train Images & Labels
-    aug_dataset_dir = root / "outputs" / "augment" / "base_seed0" / "dataset"
+    candidate_dirs = list(root.glob("outputs/augment/base_seed*/dataset"))
+    if candidate_dirs:
+        candidate_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        aug_dataset_dir = candidate_dirs[0]
+    else:
+        aug_dataset_dir = root / "outputs" / "augment" / "base_seed0" / "dataset"
+
     for img_p in (aug_dataset_dir / "images").glob("*.png"):
         shutil.copy2(img_p, dist_dir / "train" / "images" / img_p.name)
 
@@ -82,7 +88,13 @@ def main():
         shutil.copytree(bank_src, dist_dir / "tooth_bank", dirs_exist_ok=True)
 
     # 5. Provenance (manifest and recipes)
-    state_src = root / "outputs" / "augment" / "base_seed0" / "state"
+    candidate_states = list(root.glob("outputs/augment/base_seed*/state"))
+    if candidate_states:
+        candidate_states.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        state_src = candidate_states[0]
+    else:
+        state_src = root / "outputs" / "augment" / "base_seed0" / "state"
+
     if (state_src / "manifest.json").exists():
         shutil.copy2(state_src / "manifest.json", dist_dir / "provenance" / "manifest.json")
     if (state_src / "recipes.jsonl").exists():
