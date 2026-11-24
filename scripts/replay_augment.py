@@ -220,12 +220,9 @@ def _setup_image_loader(
                 found_path = c
                 break
 
-        if found_path:
-            base_img = read_image_lossless(found_path)
-        else:
-            w = int(info.get("width", 800))
-            h = int(info.get("height", 400))
-            base_img = np.zeros((h, w, 3), dtype=np.uint8)
+        if found_path is None:
+            raise FileNotFoundError(f"Target image '{fn}' for replay not found (searched {[str(c) for c in candidates]})")
+        base_img = read_image_lossless(found_path)
 
         anns = [dict(a) for a in anns_by_img.get(iid, [])]
         return base_img.copy(), anns
@@ -297,9 +294,12 @@ def replay(
     else:
         exec_recipes = [copy.deepcopy(r) for r in recipes_to_replay]
 
-    # Load ToothBank
+    # Load ToothBank (the offline run records which bank directory it read patches from)
     bank_dir = run_dir / "bank"
-    if not bank_dir.exists() and manifest:
+    bank_ref = run_dir / "state" / "bank_ref.json"
+    if bank_ref.is_file():
+        bank_dir = Path(json.loads(bank_ref.read_text(encoding="utf-8"))["bank_dir"])
+    elif not bank_dir.exists() and manifest:
         bank_out_root = manifest.config.get("paths", {}).get("out_root", "")
         if bank_out_root:
             bank_dir = Path(bank_out_root) / "bank"

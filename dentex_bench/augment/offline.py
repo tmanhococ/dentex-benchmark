@@ -69,16 +69,8 @@ def _process_image_variants(task: Any) -> Tuple[List[Recipe], List[Dict[str, Any
 
     bank = ToothBank.load(Path(bank_dir))
 
-    # Prepare locator for candidate teeth
-    locator_anns = []
-    for a in img_annotations:
-        a_copy = dict(a)
-        if "fdi" not in a_copy and ("category_id_1" not in a_copy or "category_id_2" not in a_copy):
-            cat = a_copy.get("category_id", 1)
-            default_fdis = {1: 16, 2: 26, 3: 36, 4: 48}
-            a_copy["fdi"] = default_fdis.get(cat, 16)
-        locator_anns.append(a_copy)
-    locator = AnnotationToothLocator(locator_anns)
+    # Only teeth with a known FDI number can be targets; nothing is guessed
+    locator = AnnotationToothLocator([dict(a) for a in img_annotations if a.get("fdi") is not None])
 
     recipes: List[Recipe] = []
     syn_results: List[Dict[str, Any]] = []
@@ -95,12 +87,9 @@ def _process_image_variants(task: Any) -> Tuple[List[Recipe], List[Dict[str, Any
         if cfg.output.save_dataset:
             # Read or initialize image for pure execution
             img_path = Path(cfg.paths.img_dir) / target_file
-            if img_path.is_file():
-                base_img = read_image_lossless(img_path)
-            else:
-                w = int(img_info.get("width", 800))
-                h = int(img_info.get("height", 400))
-                base_img = np.zeros((h, w, 3), dtype=np.uint8)
+            if not img_path.is_file():
+                raise FileNotFoundError(f"Target image '{target_file}' not found under {cfg.paths.img_dir}")
+            base_img = read_image_lossless(img_path)
 
             loader = lambda iid: (base_img.copy(), [dict(a) for a in img_annotations])
             syn_img, syn_anns, meta = execute(rec, loader, bank)
@@ -117,6 +106,8 @@ def _process_image_variants(task: Any) -> Tuple[List[Recipe], List[Dict[str, Any
                 "width": syn_img.shape[1],
                 "height": syn_img.shape[0],
                 "orig_image_id": img_id,
+                "recipe_id": rec.recipe_id,
+                "seam_scores": meta.get("seam_scores", []),
                 "annotations": syn_anns,
             })
 
@@ -157,22 +148,19 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
         manifest = Manifest.create(run_dir, cfg)
         save_manifest(run_dir, manifest)
 
-    # 2. Bank setup & persistence
-    bank_dir = run_dir / "bank"
+    # 2. Bank: tasks read patches from the bank's own directory (paths are relative to it)
     if bank is None:
-        if ToothBank.is_cached(bank_dir) and not cfg.output.overwrite and len(ToothBank.load(bank_dir).entries) > 0:
-            bank = ToothBank.load(bank_dir)
-        elif ToothBank.is_cached(Path(cfg.paths.out_root) / "bank"):
-            bank = ToothBank.load(Path(cfg.paths.out_root) / "bank")
-        elif ToothBank.is_cached(Path("outputs/bank")):
-            bank = ToothBank.load(Path("outputs/bank"))
+        shared_bank_dir = Path(cfg.paths.out_root) / "bank"
+        if ToothBank.is_cached(shared_bank_dir) and len(ToothBank.load(shared_bank_dir).entries) > 0:
+            bank = ToothBank.load(shared_bank_dir)
         else:
-            try:
-                from scripts.build_bank import build_bank_from_config
-                bank = build_bank_from_config(out_bank_dir=bank_dir)
-            except Exception:
-                bank = ToothBank.build(cfg)
-    bank.save(bank_dir)
+            from dentex_bench.augment.bank_builder import build_tooth_bank
+            bank, _ = build_tooth_bank(cfg.paths.train_ann, cfg.paths.img_dir, shared_bank_dir, val_ann=cfg.paths.val_ann)
+    if bank.root is None:
+        raise ValueError("run_offline needs a bank loaded from (or built into) a directory; ToothBank.root is None")
+    bank_dir = bank.root
+    with open(state_dir / "bank_ref.json", "w", encoding="utf-8") as f:
+        json.dump({"bank_dir": str(bank_dir), "entries": len(bank.entries)}, f, indent=2)
 
     # 3. Load dataset annotations
     ann_path = Path(cfg.paths.train_ann)
@@ -294,7 +282,11 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
                 ann_rec["image_id"] = syn_id
                 export_annotations.append(ann_rec)
 
-        formats = [f.lower() for f in cfg.output.formats]
+        raw_formats = cfg.output.formats
+        if isinstance(raw_formats, str):
+            # CLI overrides arrive as text, e.g. "[coco]" or "coco,yolo"
+            raw_formats = [t for t in raw_formats.strip("[] ").replace(" ", "").split(",") if t]
+        formats = [f.lower() for f in raw_formats]
         if "coco" in formats:
             coco_dir = dataset_dir / "coco"
             coco_dir.mkdir(parents=True, exist_ok=True)
@@ -317,7 +309,20 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
                         except (shutil.SameFileError, IOError):
                             pass
 
-    # 8. Mark manifest complete
+    # 8. QC summary of what was actually generated
+    all_seams = [v for syn in all_synthetic_results for v in syn.get("seam_scores", [])]
+    qc_summary = {
+        "synthetic_images": len(all_synthetic_results),
+        "ops": len(all_seams),
+        "seam_score_median": float(np.median(all_seams)) if all_seams else None,
+        "seam_score_p90": float(np.percentile(all_seams, 90)) if all_seams else None,
+        "qc_max_seam_score": float((cfg.qc or {}).get("max_seam_score", 2.5)),
+        "seam_score_above_qc_max": int(sum(v > float((cfg.qc or {}).get("max_seam_score", 2.5)) for v in all_seams)),
+    }
+    with open(state_dir / "qc_summary.json", "w", encoding="utf-8") as f:
+        json.dump(qc_summary, f, indent=2)
+
+    # 9. Mark manifest complete
     final_done_idx = len(raw_images) - 1
     update_progress(run_dir, last_done_index=final_done_idx, status="complete")
 

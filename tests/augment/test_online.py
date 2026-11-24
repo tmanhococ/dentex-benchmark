@@ -7,6 +7,7 @@ from pathlib import Path
 from dentex_bench.augment.online import SwapAugmentDataset
 from dentex_bench.augment.config import load_config, AugmentConfig
 from dentex_bench.augment.bank import ToothBank, ToothEntry
+from real_bank import make_real_bank
 from dentex_bench.augment.locator import ToothLocator, LocatedTooth, AnnotationToothLocator
 
 
@@ -79,7 +80,7 @@ def _create_mock_bank():
         mask_source="polygon",
         healthy_score=None,
     )
-    return ToothBank([entry])
+    return make_real_bank([entry])
 
 
 def _create_mock_locator():

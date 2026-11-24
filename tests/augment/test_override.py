@@ -4,6 +4,7 @@ import pytest
 
 from dentex_bench.augment.recipe import execute, Recipe
 from dentex_bench.augment.bank import ToothBank, ToothEntry
+from real_bank import make_real_bank
 
 
 def _make_dummy_bank() -> ToothBank:
@@ -30,7 +31,7 @@ def _make_dummy_bank() -> ToothBank:
         roi_mask_path="",
         mask_source="polygon",
     )
-    return ToothBank([entry])
+    return make_real_bank([entry])
 
 
 def _make_test_recipe(blend_mode: str = "hard") -> Recipe:

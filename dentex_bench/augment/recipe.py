@@ -26,7 +26,8 @@ from dentex_bench.augment.blending import (
     blend_images,
 )
 from dentex_bench.augment.labels import update_annotations_for_swap
-from dentex_bench.augment.masks import compute_ring_mask
+from dentex_bench.augment.masks import compute_ring_mask, polygon_to_mask
+from dentex_bench.augment.qc import compute_seam_score
 from dentex_bench.augment.io_utils import read_image_lossless
 
 
@@ -96,6 +97,8 @@ def resolve(
             "scale_jitter": j_scale,
             "rotate_jitter": j_rot,
             "blend_mode": blend_mode,
+            "feather_sigma": float(cfg.blend.feather_sigma),
+            "core_erode_px": int(cfg.blend.core_erode_px),
             "noise_seed": noise_seed,
             "inpaint": {
                 "enabled": cfg.blend.inpaint_target,
@@ -123,111 +126,151 @@ def resolve(
     )
 
 
+def _target_tooth_mask(target_ref: Dict[str, Any], h: int, w: int) -> np.ndarray:
+    """Outline of the tooth being replaced: its DENTEX polygon, or the ellipse inscribed in its box."""
+    seg = target_ref.get("segmentation")
+    if seg:
+        mask = polygon_to_mask(seg, h, w)
+        if np.any(mask):
+            return mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    bx, by, bw, bh = [float(v) for v in target_ref.get("bbox", [0, 0, 0, 0])]
+    if bw > 0 and bh > 0:
+        cv2.ellipse(mask, (int(round(bx + bw / 2)), int(round(by + bh / 2))),
+                    (max(1, int(round(bw / 2))), max(1, int(round(bh / 2)))), 0, 0, 360, 255, -1)
+    return mask
+
+
+def _gray(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        return img
+    if img.shape[2] == 1:
+        return img[:, :, 0]
+    return cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
+
+
+def _match_layout(img: np.ndarray, like: np.ndarray) -> np.ndarray:
+    """Converts img to the channel layout of like (gray / RGB)."""
+    if like.ndim == 2:
+        return _gray(img)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if like.shape[2] == 1:
+        return _gray(img)[:, :, None]
+    return img[:, :, :3]
+
+
 def execute(
     recipe: Recipe,
     image_loader: Callable[[int], Tuple[np.ndarray, List[Dict[str, Any]]]],
     bank: ToothBank,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], Dict[str, Any]]:
-    """Pure execution of a recipe without any non-seeded RNG calls (INV-8).
+    """Pure execution of a recipe without any RNG calls (INV-8).
 
-    Guarantees deterministic bit-exact output for identical inputs and enforces
-    label synchronization respecting INV-6.
+    For each op the target tooth outline is inpainted, the source tooth patch (read from the bank,
+    never substituted) is warped onto the target box, its brightness is matched to the bone/soft
+    tissue ring around the target, and it is blended in with an untouched core. Labels follow INV-6.
+    Raises FileNotFoundError / KeyError when a bank entry or file is missing.
     """
     dst_img, dst_anns = image_loader(recipe.target_image_id)
     out_img = dst_img.copy()
     out_anns = [dict(a) for a in dst_anns]
     h, w = out_img.shape[:2]
+    seam_scores: List[float] = []
 
     for op_data in recipe.ops:
         src_entry = bank.get(op_data["source_entry_id"])
-        if not src_entry:
-            continue
+        if src_entry is None:
+            raise KeyError(f"Bank entry '{op_data['source_entry_id']}' used by {recipe.recipe_id} is not in the bank")
 
         target_ref = op_data.get("target_tooth_ref", {})
-        dst_bbox = target_ref.get("bbox", [0.0, 0.0, 0.0, 0.0])
+        dst_bbox = [float(v) for v in target_ref.get("bbox", [0.0, 0.0, 0.0, 0.0])]
+        if len(dst_bbox) < 4 or dst_bbox[2] <= 0 or dst_bbox[3] <= 0:
+            continue
 
-        # Target inpainting
-        inpaint_cfg = op_data.get("inpaint", {})
-        do_inpaint = inpaint_cfg.get("enabled", True) if isinstance(inpaint_cfg, dict) else True
-        if do_inpaint and len(dst_bbox) >= 4 and dst_bbox[2] > 0 and dst_bbox[3] > 0:
-            target_mask = np.zeros((h, w), dtype=np.uint8)
-            bx, by, bw, bh = dst_bbox
-            y1, y2 = max(0, int(by)), min(h, int(by + bh))
-            x1, x2 = max(0, int(bx)), min(w, int(bx + bw))
-            if y2 > y1 and x2 > x1:
-                target_mask[y1:y2, x1:x2] = 255
-                inpaint_radius = inpaint_cfg.get("radius", 5) if isinstance(inpaint_cfg, dict) else 5
-                out_img = inpaint_target_tooth(out_img, target_mask, radius=inpaint_radius)
+        patch = _match_layout(read_image_lossless(bank.resolve_path(src_entry.patch_path)), out_img)
+        roi_src = read_image_lossless(bank.resolve_path(src_entry.roi_mask_path))
+        roi_src = (_gray(roi_src) > 0).astype(np.uint8) * 255
 
-        # Affine matrix alignment
+        # Affine: source tooth box centre -> target tooth box centre, scaled to the target box
         src_roi = src_entry.roi_xywh
         src_bw = max(1.0, float(src_entry.bbox_xywh[2]))
         src_bh = max(1.0, float(src_entry.bbox_xywh[3]))
-        src_cx = (src_entry.bbox_xywh[0] - src_roi[0]) + src_entry.bbox_xywh[2] / 2.0
-        src_cy = (src_entry.bbox_xywh[1] - src_roi[1]) + src_entry.bbox_xywh[3] / 2.0
+        src_cx = (src_entry.bbox_xywh[0] - src_roi[0]) + src_bw / 2.0
+        src_cy = (src_entry.bbox_xywh[1] - src_roi[1]) + src_bh / 2.0
         dst_cx = dst_bbox[0] + dst_bbox[2] / 2.0
         dst_cy = dst_bbox[1] + dst_bbox[3] / 2.0
-
-        scale_jitter = op_data.get("scale_jitter", 1.0)
-        scale_x = (dst_bbox[2] / src_bw) * scale_jitter
-        scale_y = (dst_bbox[3] / src_bh) * scale_jitter
-
-        rot_jitter = op_data.get("rotate_jitter", 0.0)
+        scale_jitter = float(op_data.get("scale_jitter", 1.0))
         M = compute_affine_matrix(
             (src_cx, src_cy),
             (dst_cx, dst_cy),
-            src_entry.axis_angle_deg,
-            rot_jitter,
-            scale_x,
-            scale_y,
-            mirror=op_data.get("mirror", False),
+            0.0,
+            float(op_data.get("rotate_jitter", 0.0)),
+            (dst_bbox[2] / src_bw) * scale_jitter,
+            (dst_bbox[3] / src_bh) * scale_jitter,
+            mirror=bool(op_data.get("mirror", False)),
         )
 
-        # Warp and blend
-        has_patch = bool(src_entry.patch_path and Path(src_entry.patch_path).is_file())
-        has_mask = bool(src_entry.roi_mask_path and Path(src_entry.roi_mask_path).is_file())
+        warped_patch = warp_image(patch, M, (w, h))
+        warped_roi = warp_mask(roi_src, M, (w, h))
+        valid = warp_mask(np.full(patch.shape[:2], 255, dtype=np.uint8), M, (w, h))
+        if not np.any(warped_roi):
+            continue
 
-        intensity_cfg = op_data.get("intensity")
-        if has_patch:
-            patch = read_image_lossless(src_entry.patch_path)
-            if intensity_cfg and isinstance(intensity_cfg, dict) and intensity_cfg.get("mode", "none") != "none":
-                patch = apply_intensity_match(patch, intensity_cfg)
+        # Brightness: match the source ring (around the pasted region) to the target ring
+        intensity_cfg = op_data.get("intensity") or {}
+        mode = intensity_cfg.get("mode", "meanstd") if isinstance(intensity_cfg, dict) else "meanstd"
+        if mode != "none" and isinstance(intensity_cfg, dict) and ("a" in intensity_cfg or "lut" in intensity_cfg):
+            # Parameters pinned in the recipe (e.g. by a replay override) are applied as given
+            warped_patch = apply_intensity_match(warped_patch, intensity_cfg)
+        elif mode == "meanstd":
+            ring = compute_ring_mask(warped_roi, ring_width_px=15)
+            src_px = _gray(warped_patch)[cv2.bitwise_and(ring, valid) > 0].astype(np.float64)
+            dst_px = _gray(out_img)[ring > 0].astype(np.float64)
+            if src_px.size and dst_px.size:
+                # Gain kept near 1 so the lesion contrast inside the tooth is not stretched
+                if src_px.std() < 1.0 or dst_px.std() < 1.0:
+                    a = 1.0  # flat ring: a gain ratio would be meaningless, shift only
+                else:
+                    a = float(np.clip(dst_px.std() / src_px.std(), 0.8, 1.25))
+                b = float(dst_px.mean() - a * src_px.mean())
+                warped_patch = apply_intensity_match(warped_patch, {"mode": "meanstd", "a": a, "b": b})
+        elif mode == "histogram":
+            ring = compute_ring_mask(warped_roi, ring_width_px=15)
+            params = compute_intensity_match_params(
+                _gray(warped_patch), _gray(out_img), cv2.bitwise_and(ring, valid), ring, mode="histogram"
+            )
+            warped_patch = apply_intensity_match(warped_patch, params)
 
-            if has_mask:
-                mask = read_image_lossless(src_entry.roi_mask_path)
-            else:
-                mask = np.ones(patch.shape[:2], dtype=np.uint8) * 255
-            warped_patch = warp_image(patch, M, (w, h))
-            warped_mask = warp_mask(mask, M, (w, h))
-            if warped_patch.ndim == 2 and out_img.ndim == 3:
-                warped_patch = cv2.cvtColor(warped_patch, cv2.COLOR_GRAY2RGB)
-            elif warped_patch.ndim == 3 and out_img.ndim == 2:
-                warped_patch = cv2.cvtColor(warped_patch, cv2.COLOR_RGB2GRAY)
-            out_img = blend_images(
-                warped_patch, out_img, warped_mask, mode=op_data.get("blend_mode", "core_preserving")
-            )
-        else:
-            dummy_patch = np.full_like(out_img, 180)
-            if intensity_cfg and isinstance(intensity_cfg, dict) and intensity_cfg.get("mode", "none") != "none":
-                dummy_patch = apply_intensity_match(dummy_patch, intensity_cfg)
-            dummy_mask = np.zeros((h, w), dtype=np.uint8)
-            y1, y2 = max(0, int(dst_cy - 20)), min(h, int(dst_cy + 20))
-            x1, x2 = max(0, int(dst_cx - 20)), min(w, int(dst_cx + 20))
-            if y2 > y1 and x2 > x1:
-                dummy_mask[y1:y2, x1:x2] = 255
-            out_img = blend_images(
-                dummy_patch, out_img, dummy_mask, mode=op_data.get("blend_mode", "core_preserving")
-            )
+        # Remove the target tooth (outline + a few px) before pasting, so no ghost tooth shows through
+        inpaint_cfg = op_data.get("inpaint", {})
+        if not isinstance(inpaint_cfg, dict) or inpaint_cfg.get("enabled", True):
+            grow = max(3, int(round(0.04 * dst_bbox[2])))
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
+            target_mask = cv2.dilate(_target_tooth_mask(target_ref, h, w), k)
+            radius = inpaint_cfg.get("radius", 5) if isinstance(inpaint_cfg, dict) else 5
+            out_img = inpaint_target_tooth(out_img, target_mask, radius=radius)
+
+        paste_mask = cv2.bitwise_and(warped_roi, valid)
+        out_img = blend_images(
+            warped_patch,
+            out_img,
+            paste_mask,
+            mode=op_data.get("blend_mode", "core_preserving"),
+            feather_sigma=float(op_data.get("feather_sigma", 5.0)),
+            core_erode_px=int(op_data.get("core_erode_px", 6)),
+        )
+        seam_scores.append(round(float(compute_seam_score(out_img, paste_mask)), 4))
 
         # Synchronize labels (INV-6)
-        dummy_op = SwapOp(
+        op = SwapOp(
             op=op_data.get("op", "swap"),
             source_entry_id=op_data["source_entry_id"],
             target_image_id=recipe.target_image_id,
             target_fdi=op_data["target_fdi"],
-            target_tooth_ref=op_data["target_tooth_ref"],
+            target_tooth_ref=target_ref,
             mirror=op_data.get("mirror", False),
         )
-        out_anns = update_annotations_for_swap(out_anns, dummy_op, src_entry, M, w, h)
+        out_anns = update_annotations_for_swap(out_anns, op, src_entry, M, w, h)
 
-    return out_img, out_anns, {"status": "success"}
+    return out_img, out_anns, {"status": "success", "seam_scores": seam_scores}

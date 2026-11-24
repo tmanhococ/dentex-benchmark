@@ -55,6 +55,7 @@ def parse_args(args=None):
     parser.add_argument("--resume", action="store_true", help="Resume from last.pth if found in output directory")
     parser.add_argument("--eval-interval", type=int, default=1, help="Run validation evaluation every N epochs")
     parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers (0 avoids fork deadlock)")
+    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (default: 16 // batch_size)")
     return parser.parse_args(args)
 
 
@@ -138,11 +139,13 @@ def main(args=None):
         cfg.gradient_accumulation_steps = max(1, 16 // max(1, cfg.batch_size))
     if args.lr is not None:
         cfg.learning_rate = args.lr
+    if getattr(args, "grad_accum", None):
+        cfg.gradient_accumulation_steps = max(1, int(args.grad_accum))
     if getattr(args, "num_workers", None) is not None:
         cfg.num_workers = args.num_workers
 
     print(f"=== Starting Training: {args.model.upper()} ===")
-    print(f"Device: {cfg.device} ({cfg.vram_gb} GB VRAM) | Batch size: {cfg.batch_size} (Grad Accum: {cfg.gradient_accumulation_steps})")
+    print(f"Device: {cfg.device} ({cfg.vram_gb} GB VRAM) | Batch size: {cfg.batch_size} (Grad Accum: {cfg.gradient_accumulation_steps})", flush=True)
 
     # Initialize runner
     runners = {
@@ -225,6 +228,11 @@ def main(args=None):
                     history = json.load(f)
             except Exception:
                 pass
+        if history:
+            if val_ann.exists():
+                best_score = max(h.get("val_mAP50", float("-inf")) for h in history)
+            else:
+                best_score = max(-h["loss"] for h in history)
         print(f"[dentex_bench] Resumed from {last_pth} at epoch {start_epoch}/{cfg.epochs}", flush=True)
 
     if val_ann.exists():
@@ -262,11 +270,13 @@ def main(args=None):
         format_val = lambda v: f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
         print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {format_val(v)}" for k, v in record.items() if k not in ("epoch", "augmentation")), flush=True)
 
-        # Always update last.pth at current epoch
-        runner.save_checkpoint(output_dir / "last.pth", extra_info=record)
+        # Always update last.pth and history at the current epoch, so a disconnect loses at most one epoch
         if score > best_score:
             best_score = score
             runner.save_checkpoint(output_dir / "best.pth", extra_info=record)
+        runner.save_checkpoint(output_dir / "last.pth", extra_info=record)
+        with open(output_dir / "history.json", "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
 
     # Save history json and curve plot
     with open(output_dir / "history.json", "w", encoding="utf-8") as f:

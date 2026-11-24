@@ -40,8 +40,10 @@ class ToothEntry:
 
 
 class ToothBank:
-    def __init__(self, entries: List[ToothEntry]):
+    def __init__(self, entries: List[ToothEntry], root: Optional[Union[str, Path]] = None):
         self.entries = list(entries)
+        # Directory that patch_path / mask_path / roi_mask_path are relative to
+        self.root: Optional[Path] = Path(root).resolve() if root is not None else None
         self._by_id = {e.entry_id: e for e in self.entries}
         self._by_fdi: Dict[int, List[ToothEntry]] = {}
         self._by_class: Dict[str, List[ToothEntry]] = {}
@@ -57,6 +59,22 @@ class ToothBank:
             raise AssertionError(
                 f"INV-1 VIOLATION: Validation image IDs leaked into bank: {leaked}"
             )
+
+    def resolve_path(self, rel_path: str) -> Path:
+        """
+        Absolute path of a bank file. Raises FileNotFoundError when it does not exist, so a
+        missing patch can never be silently replaced by placeholder pixels.
+        """
+        if not rel_path:
+            raise FileNotFoundError("Bank entry has an empty file path")
+        p = Path(rel_path)
+        if not p.is_absolute():
+            if self.root is None:
+                raise FileNotFoundError(f"Bank has no root directory to resolve '{rel_path}'")
+            p = self.root / p
+        if not p.is_file():
+            raise FileNotFoundError(f"Bank file not found: {p}")
+        return p
 
     def get(self, entry_id: str) -> Optional[ToothEntry]:
         return self._by_id.get(entry_id)
@@ -101,9 +119,5 @@ class ToothBank:
                 if line.strip():
                     data = json.loads(line)
                     entries.append(ToothEntry(**data))
-        return cls(entries)
+        return cls(entries, root=bank_dir)
 
-    @classmethod
-    def build(cls, cfg: Optional[Any] = None) -> "ToothBank":
-        """Build ToothBank instance."""
-        return cls([])

@@ -7,6 +7,7 @@ import pytest
 
 from dentex_bench.augment.config import load_config
 from dentex_bench.augment.bank import ToothBank, ToothEntry
+from real_bank import make_real_bank, write_images_for_ann
 from dentex_bench.augment.offline import run_offline
 
 
@@ -34,7 +35,7 @@ def _make_test_bank() -> ToothBank:
         roi_mask_path="",
         mask_source="polygon",
     )
-    return ToothBank([entry])
+    return make_real_bank([entry])
 
 
 def _make_test_ann_file(path: Path, num_images: int = 4) -> None:
@@ -94,6 +95,7 @@ def test_multiprocessing_invariance_with_populated_recipes(tmp_path):
         cli_overrides=[
             f"paths.out_root={tmp_path / 'out_pop_w1'}",
             f"paths.train_ann={ann_file}",
+            f"paths.img_dir={write_images_for_ann(ann_file)}",
             "offline.num_workers=1",
             "offline.variants_per_image=2",
             "output.save_dataset=false",
@@ -104,6 +106,7 @@ def test_multiprocessing_invariance_with_populated_recipes(tmp_path):
         cli_overrides=[
             f"paths.out_root={tmp_path / 'out_pop_w4'}",
             f"paths.train_ann={ann_file}",
+            f"paths.img_dir={write_images_for_ann(ann_file)}",
             "offline.num_workers=4",
             "offline.variants_per_image=2",
             "output.save_dataset=false",
@@ -134,6 +137,7 @@ def test_offline_save_dataset_coco_and_yolo(tmp_path):
         cli_overrides=[
             f"paths.out_root={out_root}",
             f"paths.train_ann={ann_file}",
+            f"paths.img_dir={write_images_for_ann(ann_file)}",
             "offline.num_workers=2",
             "offline.variants_per_image=1",
             "output.save_dataset=true",

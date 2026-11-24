@@ -1,94 +1,80 @@
 """
 tests/test_colab_augment_notebook.py
-Verifies that 04_colab_dentex_augment_run_all.ipynb is structurally valid,
-syntactically clean, and executes without unhandled errors.
+Verifies that 04_colab_dentex_augment_run_all.ipynb is structurally valid, syntactically clean,
+and runs end to end (Run all) on a DENTEX-format mock dataset in a throwaway copy of the repo.
 """
 
 import ast
 import json
 import shutil
+import sys
 from pathlib import Path
+
 import nbformat
 import pytest
 from nbconvert.preprocessors import ExecutePreprocessor
 
+NB_PATH = Path("notebooks/04_colab_dentex_augment_run_all.ipynb")
+
 
 def test_notebook_structure_and_schema():
-    nb_path = Path("notebooks/04_colab_dentex_augment_run_all.ipynb")
-    assert nb_path.exists(), "Notebook 04_colab_dentex_augment_run_all.ipynb does not exist!"
-
-    with open(nb_path, "r", encoding="utf-8") as f:
-        nb = json.load(f)
-
-    assert "cells" in nb, "Notebook missing 'cells' key"
-    assert "metadata" in nb, "Notebook missing 'metadata' key"
-    assert nb.get("nbformat") == 4, f"Unexpected nbformat: {nb.get('nbformat')}"
-    assert len(nb["cells"]) >= 10, f"Expected at least 10 cells, got {len(nb['cells'])}"
-
+    nb = json.loads(NB_PATH.read_text(encoding="utf-8"))
+    assert nb.get("nbformat") == 4
+    assert len(nb["cells"]) >= 10
     for idx, cell in enumerate(nb["cells"]):
-        assert "cell_type" in cell, f"Cell {idx} missing cell_type"
-        assert "source" in cell, f"Cell {idx} missing source"
-        assert len(cell["source"]) > 0, f"Cell {idx} is empty"
+        assert cell.get("source"), f"Cell {idx} is empty"
 
 
 def test_notebook_code_cells_ast_syntax():
-    nb_path = Path("notebooks/04_colab_dentex_augment_run_all.ipynb")
-    with open(nb_path, "r", encoding="utf-8") as f:
-        nb = json.load(f)
-
+    nb = json.loads(NB_PATH.read_text(encoding="utf-8"))
     for idx, cell in enumerate(nb["cells"]):
         if cell["cell_type"] == "code":
-            source = "".join(cell["source"])
             try:
-                ast.parse(source)
+                ast.parse("".join(cell["source"]))
             except SyntaxError as e:
                 pytest.fail(f"Cell {idx} failed Python syntax check: {e}")
 
 
+def test_notebook_never_guesses_fdi_or_fakes_patches():
+    src = NB_PATH.read_text(encoding="utf-8")
+    assert "infer_fdi" not in src
+    assert "dummy" not in src.lower()
+
+
 def test_headless_execution_colab_notebook(tmp_path):
-    """
-    Executes notebook headlessly with mock data to guarantee zero runtime crashes.
-    """
-    nb_path = Path("notebooks/04_colab_dentex_augment_run_all.ipynb")
-    with open(nb_path, "r", encoding="utf-8") as f:
-        nb = nbformat.read(f, as_version=4)
+    """Run all on mock DENTEX data: 1 model x (baseline, augmented), 1 epoch."""
+    sys.path.insert(0, str(Path("tests/augment").resolve()))
+    from test_real_swap_pipeline import _make_dentex_dataset
 
-    # Set up temporary test drive directory
-    mock_drive_dir = tmp_path / "mock_drive"
-    mock_output_dir = tmp_path / "mock_drive_output"
-    mock_drive_dir.mkdir(parents=True, exist_ok=True)
-    mock_output_dir.mkdir(parents=True, exist_ok=True)
+    repo = tmp_path / "repo"
+    for d in ["dentex_bench", "scripts", "configs"]:
+        shutil.copytree(d, repo / d, ignore=shutil.ignore_patterns("__pycache__"))
+    drive = tmp_path / "drive" / "DENTEX" / "training_data" / "quadrant-enumeration-disease"
+    _make_dentex_dataset(drive, n_images=10)
+    out_dir = tmp_path / "drive_out"
 
-    # Copy local sample data into mock drive
-    if Path("data/raw").exists():
-        shutil.copytree("data/raw", mock_drive_dir / "raw", dirs_exist_ok=True)
-    if Path("data/processed").exists():
-        shutil.copytree("data/processed", mock_drive_dir / "processed", dirs_exist_ok=True)
+    nb = nbformat.read(NB_PATH, as_version=4)
+    overrides = {
+        "DRIVE_DATA_DIR =": f"DRIVE_DATA_DIR = r'{tmp_path / 'drive' / 'DENTEX'}'",
+        "DRIVE_OUTPUT_DIR =": f"DRIVE_OUTPUT_DIR = r'{out_dir}'",
+        "MODELS =": "MODELS = ['faster_rcnn']",
+        "EPOCHS =": "EPOCHS = 1",
+        "NUM_AUGMENT_PER_IMAGE =": "NUM_AUGMENT_PER_IMAGE = 1",
+        "QC_PAIRS =": "QC_PAIRS = 2",
+    }
+    cfg_cell = next(c for c in nb.cells if c.cell_type == "code" and "DRIVE_DATA_DIR =" in c.source)
+    lines = []
+    for line in cfg_cell.source.splitlines():
+        key = next((k for k in overrides if line.startswith(k)), None)
+        lines.append(overrides[key] if key else line)
+    cfg_cell.source = "\n".join(lines)
 
-    # Modify Cell 0 in the executed notebook to point to tmp_path and use 1 epoch
-    for cell in nb.cells:
-        if cell.cell_type == "code" and "DRIVE_DATA_DIR" in "".join(cell.source):
-            lines = cell.source
-            new_lines = []
-            for l in lines:
-                if l.startswith("DRIVE_DATA_DIR ="):
-                    new_lines.append(f"DRIVE_DATA_DIR = r'{mock_drive_dir}'\n")
-                elif l.startswith("DRIVE_OUTPUT_DIR ="):
-                    new_lines.append(f"DRIVE_OUTPUT_DIR = r'{mock_output_dir}'\n")
-                elif l.startswith("EPOCHS ="):
-                    new_lines.append("EPOCHS = 1\n")
-                elif l.startswith("NUM_AUGMENT_PER_IMAGE ="):
-                    new_lines.append("NUM_AUGMENT_PER_IMAGE = 1\n")
-                else:
-                    new_lines.append(l)
-            cell.source = "".join(new_lines)
-            break
+    ExecutePreprocessor(timeout=1800, kernel_name="python3").preprocess(nb, {"metadata": {"path": str(repo)}})
 
-    ep = ExecutePreprocessor(timeout=300, kernel_name="python3")
-    ep.preprocess(nb, {"metadata": {"path": "."}})
-
-    for idx, cell in enumerate(nb.cells):
-        if cell.cell_type == "code":
-            for out in cell.get("outputs", []):
-                if out.get("output_type") == "error":
-                    pytest.fail(f"Cell {idx} execution failed: {out.get('ename')}: {out.get('evalue')}")
+    run_out = out_dir / "v2_realswap"
+    status = json.loads((run_out / "train_status.json").read_text())
+    assert status == {"baseline/faster_rcnn": "done", "augmented/faster_rcnn": "done"}
+    with open(run_out / "results_table.csv", encoding="utf-8") as f:
+        assert len(f.read().strip().splitlines()) == 3  # header + 2 runs
+    assert (run_out / "qc_before_after.png").is_file()
+    assert (run_out / "checkpoints" / "augmented" / "faster_rcnn" / "last.pth").is_file()

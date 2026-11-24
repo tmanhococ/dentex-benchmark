@@ -44,8 +44,8 @@ placement:
 
 geometry:
   isotropic: false
-  scale_min: 0.85
-  scale_max: 1.15
+  scale_min: 0.75
+  scale_max: 1.33
   max_rotate_deg: 10
   jitter_scale: 0.05
   jitter_rotate_deg: 3

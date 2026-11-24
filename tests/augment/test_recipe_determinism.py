@@ -9,6 +9,7 @@ from dentex_bench.augment.config import AugmentConfig
 from dentex_bench.augment.bank import ToothBank, ToothEntry
 from dentex_bench.augment.locator import AnnotationToothLocator
 from dentex_bench.augment.io_utils import write_image_lossless
+from real_bank import make_real_bank
 
 
 def test_execute_is_pure_deterministic(monkeypatch):
@@ -121,7 +122,7 @@ def test_execute_with_ops_pure_and_deterministic(monkeypatch):
         roi_mask_path="",
         mask_source="polygon",
     )
-    bank = ToothBank([src_entry])
+    bank = make_real_bank([src_entry])
 
     recipe = Recipe(
         recipe_id="rec_10_0",

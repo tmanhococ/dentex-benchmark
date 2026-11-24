@@ -131,89 +131,79 @@ def generate_swap_plan(
     - Per-op retry budget: Attempts are tracked per op up to cfg.placement.max_tries.
     """
     plan = SwapPlan(target_image_id=target_image_id)
-    target_teeth = locator.teeth(target_image_id)
+    target_teeth = _merge_teeth_by_fdi(locator.teeth(target_image_id))
     if not target_teeth:
         return plan
 
     n_ops = int(rng.integers(cfg.placement.min_ops, cfg.placement.max_ops + 1))
     n_ops = min(n_ops, len(target_teeth))
 
-    used_fdis = set()
+    if cfg.placement.mode == "symmetric":
+        image_pool = [e for e in bank.entries if e.image_id == target_image_id]
+    else:
+        image_pool = [e for e in bank.entries if e.image_id != target_image_id]
 
+    used_fdis = set()
     for _ in range(n_ops):
         available_teeth = [t for t in target_teeth if t.fdi not in used_fdis]
         if not available_teeth:
             break
 
         attempts_per_op = 0
-        while attempts_per_op < cfg.placement.max_tries:
+        while attempts_per_op < cfg.placement.max_tries and available_teeth:
             attempts_per_op += 1
-            dst_tooth = available_teeth[rng.integers(0, len(available_teeth))]
+            dst_tooth = available_teeth[int(rng.integers(0, len(available_teeth)))]
 
-            # Candidate selection from bank
-            if cfg.placement.mode == "symmetric":
-                candidates = [e for e in bank.entries if e.image_id == target_image_id]
-            else:
-                candidates = [e for e in bank.entries if e.image_id != target_image_id]
-
-            if not candidates:
+            # Candidates are filtered rule by rule; the rule that empties the pool is logged
+            if not image_pool:
                 plan.rejections.append({"code": "R_SAME_IMAGE", "tries": attempts_per_op})
                 break
+            pool = image_pool
+            if tooth_number(dst_tooth.fdi) != 8:
+                pool = [e for e in pool if e.roi_class != "impacted"]
+                if not pool:
+                    plan.rejections.append({"code": "R_IMPACTED", "tries": attempts_per_op})
+                    available_teeth.remove(dst_tooth)
+                    continue
 
-            # Class weighting
+            matched = []
+            for e in pool:
+                if cfg.placement.mode == "fdi_swap":
+                    valid, mirror = is_valid_swap_pair(e.fdi, dst_tooth.fdi, allow_mirror=cfg.placement.allow_mirror)
+                elif cfg.placement.mode == "symmetric":
+                    valid, mirror = is_valid_swap_pair(e.fdi, dst_tooth.fdi, allow_mirror=True)
+                    valid = valid and mirror
+                else:
+                    valid, mirror = True, False
+                if valid:
+                    matched.append((e, mirror))
+            if not matched:
+                plan.rejections.append({"code": "R_FDI_MISMATCH", "tries": attempts_per_op})
+                available_teeth.remove(dst_tooth)
+                continue
+
+            scaled = [
+                (e, m) for e, m in matched
+                if check_scale_rule(e.bbox_xywh, dst_tooth.bbox, cfg.geometry.scale_min, cfg.geometry.scale_max)
+            ]
+            if not scaled:
+                plan.rejections.append({"code": "R_SCALE", "tries": attempts_per_op})
+                available_teeth.remove(dst_tooth)
+                continue
+
+            # Class weighting among the anatomically valid candidates
             if cfg.placement.class_weights:
-                weights = np.array(
-                    [cfg.placement.class_weights.get(e.roi_class, 1.0) for e in candidates],
-                    dtype=float,
-                )
+                weights = np.array([cfg.placement.class_weights.get(e.roi_class, 1.0) for e, _ in scaled], dtype=float)
             elif cfg.placement.class_weight_power is not None:
-                counts = Counter(e.roi_class for e in candidates)
-                weights = np.array(
-                    [(1.0 / counts[e.roi_class]) ** cfg.placement.class_weight_power for e in candidates],
-                    dtype=float,
-                )
+                counts = Counter(e.roi_class for e, _ in scaled)
+                weights = np.array([(1.0 / counts[e.roi_class]) ** cfg.placement.class_weight_power for e, _ in scaled], dtype=float)
             else:
                 weights = None
-
             if weights is not None and weights.sum() > 0:
-                probs = weights / weights.sum()
-                idx = int(rng.choice(len(candidates), p=probs))
-                src_entry = candidates[idx]
+                idx = int(rng.choice(len(scaled), p=weights / weights.sum()))
             else:
-                src_entry = candidates[rng.integers(0, len(candidates))]
-
-            # Rejection rule: R_IMPACTED (INV-5)
-            if src_entry.roi_class == "impacted" and tooth_number(dst_tooth.fdi) != 8:
-                plan.rejections.append({"code": "R_IMPACTED", "tries": attempts_per_op})
-                continue
-
-            # Anatomical swap check (INV-4)
-            if cfg.placement.mode == "fdi_swap":
-                valid, mirror = is_valid_swap_pair(
-                    src_entry.fdi, dst_tooth.fdi, allow_mirror=cfg.placement.allow_mirror
-                )
-                if not valid:
-                    plan.rejections.append({"code": "R_FDI_MISMATCH", "tries": attempts_per_op})
-                    continue
-            elif cfg.placement.mode == "symmetric":
-                valid, mirror = is_valid_swap_pair(
-                    src_entry.fdi, dst_tooth.fdi, allow_mirror=True
-                )
-                if not (valid and mirror):
-                    plan.rejections.append({"code": "R_FDI_MISMATCH", "tries": attempts_per_op})
-                    continue
-            else:
-                mirror = False
-
-            # Scale rejection check (R_SCALE)
-            if not check_scale_rule(
-                src_entry.bbox_xywh,
-                dst_tooth.bbox,
-                cfg.geometry.scale_min,
-                cfg.geometry.scale_max,
-            ):
-                plan.rejections.append({"code": "R_SCALE", "tries": attempts_per_op})
-                continue
+                idx = int(rng.integers(0, len(scaled)))
+            src_entry, mirror = scaled[idx]
 
             op = SwapOp(
                 op="swap",
@@ -222,8 +212,9 @@ def generate_swap_plan(
                 target_fdi=dst_tooth.fdi,
                 target_tooth_ref={
                     "source": dst_tooth.source,
-                    "bbox": dst_tooth.bbox,
+                    "bbox": list(dst_tooth.bbox),
                     "has_mask": dst_tooth.segmentation is not None,
+                    "segmentation": dst_tooth.segmentation,
                 },
                 mirror=mirror,
             )
@@ -232,3 +223,34 @@ def generate_swap_plan(
             break
 
     return plan
+
+
+def _merge_teeth_by_fdi(teeth: List[LocatedTooth]) -> List[LocatedTooth]:
+    """One target per tooth: DENTEX lists a tooth once per diagnosis, so merge outlines and boxes."""
+    by_fdi: Dict[int, List[LocatedTooth]] = {}
+    for t in teeth:
+        by_fdi.setdefault(int(t.fdi), []).append(t)
+    merged = []
+    for fdi in sorted(by_fdi):
+        group = by_fdi[fdi]
+        boxes = [t.bbox for t in group if t.bbox and len(t.bbox) == 4]
+        if not boxes:
+            continue
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[0] + b[2] for b in boxes)
+        y2 = max(b[1] + b[3] for b in boxes)
+        segs = [p for t in group if t.segmentation for p in t.segmentation if len(p) >= 6]
+        if segs:
+            # Same reference as the bank entries: the box of the tooth outline
+            pts = np.concatenate([np.asarray(p, dtype=np.float64).reshape(-1, 2) for p in segs], axis=0)
+            x1, y1 = pts.min(axis=0)
+            x2, y2 = pts.max(axis=0)
+        merged.append(LocatedTooth(
+            fdi=fdi,
+            bbox=[float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+            segmentation=segs or None,
+            source=group[0].source,
+            score=max(t.score for t in group),
+        ))
+    return merged

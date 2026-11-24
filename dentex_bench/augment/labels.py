@@ -31,35 +31,44 @@ def update_annotations_for_swap(
 
     for ann in src_entry.annotations:
         orig_box = ann.get("bbox", [])
-        if len(orig_box) == 4:
+        if len(orig_box) != 4:
+            continue
+        warped_seg = warp_polygons(ann["segmentation"], M) if ann.get("segmentation") else None
+        if warped_seg:
+            # Box of the warped outline is tighter than the box of a rotated box
+            pts = np.concatenate([np.asarray(p, dtype=np.float64).reshape(-1, 2) for p in warped_seg], axis=0)
+            wx1, wy1 = pts.min(axis=0)
+            wx2, wy2 = pts.max(axis=0)
+            warped_box = [float(wx1), float(wy1), float(wx2 - wx1), float(wy2 - wy1)]
+        else:
             warped_box = warp_bbox(orig_box, M)
-            # Clip to image boundaries
-            bx1 = max(0.0, warped_box[0])
-            by1 = max(0.0, warped_box[1])
-            bx2 = min(float(img_w), warped_box[0] + warped_box[2])
-            by2 = min(float(img_h), warped_box[1] + warped_box[3])
+        # Clip to image boundaries
+        bx1 = max(0.0, warped_box[0])
+        by1 = max(0.0, warped_box[1])
+        bx2 = min(float(img_w), warped_box[0] + warped_box[2])
+        by2 = min(float(img_h), warped_box[1] + warped_box[3])
 
-            w_clipped = max(0.0, bx2 - bx1)
-            h_clipped = max(0.0, by2 - by1)
-            orig_area = orig_box[2] * orig_box[3]
+        w_clipped = max(0.0, bx2 - bx1)
+        h_clipped = max(0.0, by2 - by1)
+        full_area = warped_box[2] * warped_box[3]
 
-            # Drop if visible area < 50%
-            if orig_area > 0 and (w_clipped * h_clipped) / orig_area < 0.5:
-                continue
+        # Drop if visible area < 50%
+        if full_area <= 0 or (w_clipped * h_clipped) / full_area < 0.5:
+            continue
 
-            new_ann = dict(ann)
-            new_ann["bbox"] = [bx1, by1, w_clipped, h_clipped]
-            new_ann["area"] = float(w_clipped * h_clipped)
-            new_ann["fdi"] = op.target_fdi
-            new_ann["category_id_1"] = q_dst
-            new_ann["category_id_2"] = t_dst
-            new_ann["synthetic"] = True
-            if op.target_image_id is not None:
-                new_ann["image_id"] = op.target_image_id
+        new_ann = dict(ann)
+        new_ann["bbox"] = [bx1, by1, w_clipped, h_clipped]
+        new_ann["area"] = float(w_clipped * h_clipped)
+        new_ann["fdi"] = op.target_fdi
+        new_ann["category_id_1"] = q_dst
+        new_ann["category_id_2"] = t_dst
+        new_ann["synthetic"] = True
+        new_ann["source_entry_id"] = src_entry.entry_id
+        if op.target_image_id is not None:
+            new_ann["image_id"] = op.target_image_id
+        if warped_seg:
+            new_ann["segmentation"] = warped_seg
 
-            if "segmentation" in ann and ann["segmentation"]:
-                new_ann["segmentation"] = warp_polygons(ann["segmentation"], M)
-
-            filtered_anns.append(new_ann)
+        filtered_anns.append(new_ann)
 
     return filtered_anns
