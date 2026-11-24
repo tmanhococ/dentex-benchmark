@@ -33,9 +33,11 @@ Notebook này tự động hóa **toàn bộ quy trình 1-Click** từ dữ li�
 1. **Nạp & Xác thực dữ liệu X-quang thật** từ thư mục Google Drive của bạn.
 2. **Khởi tạo Tooth Bank:** Trích xuất các răng sâu, răng mọc ngầm từ tập Train kèm mask phân đoạn Otsu GrabCut.
 3. **Thực hiện ghép răng (Tooth-Swap Augmentation):** Sinh ảnh X-quang tăng cường tuân thủ nghiêm ngặt 8 invariants giải phẫu nha khoa (khớp số răng FDI 1-8, bảo toàn vị trí răng khôn 8, đối xứng qua hàm đối bên, hòa trộn biên Poisson/Gaussian).
-4. **Huấn luyện mô hình:** Train cả 2 mô hình **Baseline** và **Augmented** (Faster R-CNN / HierarchicalNet, 20-30 epochs).
-5. **Đánh giá Benchmark chuẩn:** Đo lường các chỉ số detection chuẩn COCO ($mAP_{50}$, $mAP_{50:95}$, $AR$, per-class AP, độ trễ và VRAM).
-6. **Đóng gói & Xuất bản Kaggle:** Tự động tổng hợp thành dataset đa định dạng (COCO + YOLO + Tooth Bank + Recipes), nén zip lưu về Drive và hỗ trợ push thẳng lên Kaggle Public.
+4. **Hiển thị trực quan so sánh Trước vs Sau:** Hiển thị ảnh răng trước và sau khi ghép kèm ảnh zoom cận cảnh từng chân răng/thân răng.
+5. **Lưu toàn bộ dữ liệu đã xử lý vào Google Drive:** Tự động sao lưu ảnh đã ghép, nhãn COCO/YOLO, Tooth Bank và file nén zip về Drive.
+6. **Huấn luyện mô hình:** Train cả 2 mô hình **Baseline** và **Augmented** (Faster R-CNN / HierarchicalNet, 20-30 epochs).
+7. **Đánh giá Benchmark chuẩn:** Đo lường các chỉ số detection chuẩn COCO ($mAP_{50}$, $mAP_{50:95}$, $AR$, per-class AP, độ trễ và VRAM).
+8. **Đóng gói & Xuất bản Kaggle:** Tự động tổng hợp thành dataset đa định dạng (COCO + YOLO + Tooth Bank + Recipes), nén zip lưu về Drive và hỗ trợ push thẳng lên Kaggle Public.
 
 ---
 👉 **Hướng dẫn:** Chỉ cần sửa đường dẫn `DRIVE_DATA_DIR` ở Cell 0 dưới đây thành đường dẫn thư mục dữ liệu trên Drive của bạn, sau đó chọn **Runtime → Run all** (Ctrl+F9).""")
@@ -45,13 +47,14 @@ Notebook này tự động hóa **toàn bộ quy trình 1-Click** từ dữ li�
     code("""# ==============================================================================
 # CẤU HÌNH ĐƯỜNG DẪN DỮ LIỆU TRÊN GOOGLE DRIVE
 # ==============================================================================
-# Đường dẫn đến thư mục chứa dữ liệu X-quang của bạn trên Google Drive:
+# 1. Đường dẫn đến thư mục chứa dữ liệu X-quang của bạn trên Google Drive:
 # Thư mục này có thể chứa:
 # - Ảnh X-quang (.png, .jpg) và file nhãn .json (COCO hoặc DENTEX gốc)
 # - Hoặc thư mục raw/ chứa ảnh và thư mục processed/ chứa instances_train.json
 DRIVE_DATA_DIR = '/content/drive/MyDrive/DENTEX'
 
-# Thư mục trên Google Drive để tự động lưu lại checkpoints, logs, và dataset đã đóng gói:
+# 2. Thư mục trên Google Drive để tự động lưu lại toàn bộ dữ liệu đã xử lý,
+# checkpoints, logs, và dataset hoàn chỉnh đã đóng gói (kèm file .zip):
 DRIVE_OUTPUT_DIR = '/content/drive/MyDrive/DENTEX_AUGMENT_OUTPUT'
 
 # Cấu hình GitHub Repository
@@ -287,9 +290,13 @@ if bank_items:
     plt.show()
 """)
 
-    # Cell 6: Offline Augmentation
-    md("## 🧬 Cell 6: Thực Hiện Pipeline Ghép Răng (Tooth-Swap Augmentation)")
+    # Cell 6: Offline Augmentation + Save to Drive + Visual Comparison
+    md("## 🧬 Cell 6: Thực Hiện Ghép Răng, Hiển Thị So Sánh Trước/Sau & Lưu Dữ Liệu Vào Google Drive")
     code("""from scripts.augment_offline import main as augment_offline_main
+import json, shutil, cv2
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
 
 print(f'⚙️ Đang sinh dữ liệu ghép răng nhân tạo (seed={SEED}, n={NUM_AUGMENT_PER_IMAGE} per image)...')
 augment_offline_main([
@@ -309,40 +316,130 @@ print(f'\\n✅ TỔNG HỢP DỮ LIỆU AUGMENT THÀNH CÔNG:')
 print(f'  - Tổng số ảnh train sau augment: {len(aug_coco[\"images\"])}')
 print(f'  - Tổng số nhãn tổn thương: {len(aug_coco[\"annotations\"])}')
 
-# Trực quan hóa so sánh Trước vs Sau khi Ghép Răng
-syn_imgs = [im for im in aug_coco['images'] if im['file_name'].startswith('syn_')][:2]
-if syn_imgs:
-    fig, axes = plt.subplots(len(syn_imgs), 2, figsize=(16, 5 * len(syn_imgs)))
-    if len(syn_imgs) == 1: axes = np.expand_dims(axes, axis=0)
+# ==============================================================================
+# 💾 LƯU TOÀN BỘ DỮ LIỆU ĐÃ XỬ LÝ VÀO GOOGLE DRIVE NGAY LẬP TỨC
+# ==============================================================================
+drive_processed_dir = Path(DRIVE_OUTPUT_DIR) / 'augmented_data'
+if IN_COLAB or Path(DRIVE_OUTPUT_DIR).exists():
+    drive_processed_dir.mkdir(parents=True, exist_ok=True)
+    print(f'\\n💾 Đang lưu dữ liệu đã xử lý vào Google Drive: {drive_processed_dir} ...')
     
-    for r_idx, s_info in enumerate(syn_imgs):
-        s_path = Path('outputs/augment/base_seed0/dataset/images') / s_info['file_name']
-        s_img = cv2.imread(str(s_path))
-        s_rgb = cv2.cvtColor(s_img, cv2.COLOR_BGR2RGB)
+    # 1. Lưu toàn bộ thư mục dataset (images, coco, yolo)
+    shutil.copytree('outputs/augment/base_seed0/dataset', drive_processed_dir / 'dataset', dirs_exist_ok=True)
+    
+    # 2. Lưu Tooth Bank (patches, masks, index)
+    if Path('outputs/augment/bank').exists():
+        shutil.copytree('outputs/augment/bank', drive_processed_dir / 'tooth_bank', dirs_exist_ok=True)
         
-        # Vẽ các bbox của ảnh synthetic
-        s_anns = [a for a in aug_coco['annotations'] if a['image_id'] == s_info['id']]
-        for a in s_anns:
-            bx, by, bw, bh = [int(v) for v in a['bbox']]
-            is_syn = a.get('synthetic', False)
-            color = (255, 0, 0) if is_syn else (0, 255, 0)
-            tag = ' [SWAPPED]' if is_syn else ''
-            cv2.rectangle(s_rgb, (bx, by), (bx + bw, by + bh), color, 3)
-            cv2.putText(s_rgb, f\"{CLASS_NAMES.get(a['category_id'], '')}{tag}\", (bx, max(20, by - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-        axes[r_idx, 0].imshow(s_rgb)
-        axes[r_idx, 0].set_title(f\"Synthetic: {s_info['file_name']} (Đỏ: Răng ghép | Xanh: Răng gốc)\")
-        axes[r_idx, 0].axis('off')
+    # 3. Lưu Provenance state (manifest.json, recipes.jsonl)
+    if Path('outputs/augment/base_seed0/state').exists():
+        shutil.copytree('outputs/augment/base_seed0/state', drive_processed_dir / 'state', dirs_exist_ok=True)
         
-        # Zoom chi tiết vào răng vừa ghép
-        syn_ann_item = next((a for a in s_anns if a.get('synthetic')), s_anns[0])
-        zx, zy, zw, zh = [int(v) for v in syn_ann_item['bbox']]
+    all_saved = list(drive_processed_dir.glob('**/*'))
+    print(f'✅ ĐÃ LƯU THÀNH CÔNG VÀO GOOGLE DRIVE: {len([f for f in all_saved if f.is_file()])} files!')
+    print(f'📁 Vị trí trên Drive: {drive_processed_dir}')
+
+# ==============================================================================
+# 🔍 HIỂN THỊ SO SÁNH TRỰC QUAN: ẢNH GỐC (TRƯỚC) VS ẢNH TĂNG CƯỜNG (SAU KHI GHÉP RĂNG)
+# ==============================================================================
+print('\\n🖼️ Đang hiển thị trực quan so sánh ảnh trước và sau khi ghép răng...')
+
+# Đọc recipes để bắt cặp chính xác ảnh gốc và ảnh synthetic
+recipes_p = Path('outputs/augment/base_seed0/state/recipes.jsonl')
+recipe_pairs = []
+if recipes_p.exists():
+    with open(recipes_p, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                recipe_pairs.append(r)
+
+# Chọn tối đa 3 cặp để hiển thị chi tiết
+display_pairs = recipe_pairs[:min(3, len(recipe_pairs))]
+
+CLASS_NAMES = {1: 'Caries', 2: 'Deep Caries', 3: 'Periapical', 4: 'Impacted'}
+
+for p_idx, rec in enumerate(display_pairs, 1):
+    host_file = rec.get('target_file')
+    rec_id = rec.get('recipe_id', '')
+    # Tên file synthetic tương ứng (vd syn_1_0.png)
+    tokens = rec_id.replace('rec_', '').split('_')
+    syn_file = f'syn_{tokens[0]}_{tokens[1]}.png' if len(tokens) >= 2 else None
+    
+    host_path = Path('data/raw') / host_file if host_file else None
+    syn_path = Path('outputs/augment/base_seed0/dataset/images') / syn_file if syn_file else None
+    
+    if not (host_path and host_path.exists() and syn_path and syn_path.exists()):
+        continue
+        
+    img_orig = cv2.imread(str(host_path))
+    img_syn = cv2.imread(str(syn_path))
+    if img_orig is None or img_syn is None: continue
+    
+    rgb_orig = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+    rgb_syn = cv2.cvtColor(img_syn, cv2.COLOR_BGR2RGB)
+    
+    # Tìm thông tin ảnh và annotations
+    orig_im_info = next((im for im in aug_coco['images'] if im['file_name'] == host_file), None)
+    syn_im_info = next((im for im in aug_coco['images'] if im['file_name'] == syn_file), None)
+    
+    orig_anns = [a for a in aug_coco['annotations'] if orig_im_info and a['image_id'] == orig_im_info['id']]
+    syn_anns = [a for a in aug_coco['annotations'] if syn_im_info and a['image_id'] == syn_im_info['id']]
+    
+    # 1. Vẽ bboxes trên ảnh gốc (màu xanh lá)
+    for a in orig_anns:
+        bx, by, bw, bh = [int(v) for v in a['bbox']]
+        cv2.rectangle(rgb_orig, (bx, by), (bx + bw, by + bh), (0, 255, 0), 3)
+        cv2.putText(rgb_orig, CLASS_NAMES.get(a['category_id'], 'Lesion'), (bx, max(20, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+    # 2. Vẽ bboxes trên ảnh sau ghép (Đỏ cho răng mới ghép, Xanh cho răng gốc)
+    swapped_anns = []
+    for a in syn_anns:
+        bx, by, bw, bh = [int(v) for v in a['bbox']]
+        is_syn = a.get('synthetic', False)
+        color = (255, 50, 50) if is_syn else (0, 255, 0)
+        tag = ' [GHÉP]' if is_syn else ''
+        cv2.rectangle(rgb_syn, (bx, by), (bx + bw, by + bh), color, 3)
+        cv2.putText(rgb_syn, f\"{CLASS_NAMES.get(a['category_id'], '')}{tag}\", (bx, max(20, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        if is_syn: swapped_anns.append(a)
+        
+    # Tạo bảng hiển thị 4 cột: [Ảnh gốc toàn cảnh] | [Ảnh sau ghép toàn cảnh] | [Zoom gốc] | [Zoom sau ghép]
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5), gridspec_kw={'width_ratios': [3, 3, 1.5, 1.5]})
+    
+    # Cột 1: Toàn cảnh ảnh gốc
+    axes[0].imshow(rgb_orig)
+    axes[0].set_title(f'1. TRƯỚC TĂNG CƯỜNG (GỐC)\\n{host_file} (Viền Xanh: Tổn thương gốc)', fontsize=11, color='darkgreen')
+    axes[0].axis('off')
+    
+    # Cột 2: Toàn cảnh ảnh synthetic
+    axes[1].imshow(rgb_syn)
+    axes[1].set_title(f'2. SAU TĂNG CƯỜNG (GHÉP RĂNG)\\n{syn_file} (Viền Đỏ: Răng nhân tạo vừa ghép)', fontsize=11, color='darkred')
+    axes[1].axis('off')
+    
+    # Cột 3 & 4: Zoom cận cảnh vị trí răng ghép
+    target_ann = swapped_anns[0] if swapped_anns else (syn_anns[0] if syn_anns else None)
+    if target_ann:
+        zx, zy, zw, zh = [int(v) for v in target_ann['bbox']]
         pad = 40
-        crop = s_rgb[max(0, zy - pad):min(s_rgb.shape[0], zy + zh + pad), max(0, zx - pad):min(s_rgb.shape[1], zx + zw + pad)]
-        axes[r_idx, 1].imshow(crop)
-        axes[r_idx, 1].set_title('🔍 Zoom Cận Cảnh Vị Trí Ghép Răng (Poisson Blending)')
-        axes[r_idx, 1].axis('off')
+        y1, y2 = max(0, zy - pad), min(rgb_syn.shape[0], zy + zh + pad)
+        x1, x2 = max(0, zx - pad), min(rgb_syn.shape[1], zx + zw + pad)
         
+        crop_orig = rgb_orig[y1:y2, x1:x2]
+        crop_syn = rgb_syn[y1:y2, x1:x2]
+        
+        axes[2].imshow(crop_orig)
+        axes[2].set_title('3. CẬN CẢNH TRƯỚC KHI GHÉP\\n(Vùng nhận răng gốc)', fontsize=10)
+        axes[2].axis('off')
+        
+        axes[3].imshow(crop_syn)
+        axes[3].set_title('4. CẬN CẢNH SAU KHI GHÉP\\n(Hòa trộn Poisson viền răng)', fontsize=10)
+        axes[3].axis('off')
+    else:
+        axes[2].axis('off'); axes[3].axis('off')
+        
+    plt.suptitle(f'🦷 CẶP MẪU #{p_idx}: SO SÁNH TRỰC QUAN TRƯỚC VÀ SAU KHI TĂNG CƯỜNG DỮ LIỆU', fontsize=13, weight='bold')
     plt.tight_layout()
     plt.show()
 """)
@@ -458,8 +555,10 @@ display(Markdown(f\"\"\"
 """)
 
     # Cell 9: Package Dataset & Zip
-    md("## 📦 Cell 9: Đóng Gói Dataset Đầy Đủ & Đồng Bộ Về Google Drive")
+    md("## 📦 Cell 9: Đóng Gói Dataset Đầy Đủ & Đồng Bộ Toàn Bộ Về Google Drive")
     code("""from scripts.package_kaggle_dataset import main as package_dataset_main
+import shutil
+from pathlib import Path
 
 print('📦 Đang đóng gói dataset thành chuẩn COCO + YOLO + Tooth Bank + Lineage Recipes...')
 package_dataset_main()
@@ -471,12 +570,22 @@ print(f'✅ Đã tạo gói dataset tại: {pkg_dir}')
 print(f'✅ File zip nén: {zip_path} ({zip_path.stat().st_size / (1024**2):.2f} MB)')
 
 if IN_COLAB and Path(DRIVE_OUTPUT_DIR).exists():
-    drive_dataset_dir = Path(DRIVE_OUTPUT_DIR) / 'dataset'
-    drive_dataset_dir.mkdir(parents=True, exist_ok=True)
-    print(f'💾 Đang đồng bộ toàn bộ dataset và file zip về Google Drive ({drive_dataset_dir})...')
-    shutil.copy2(zip_path, drive_dataset_dir / zip_path.name)
-    shutil.copytree(pkg_dir, drive_dataset_dir / pkg_dir.name, dirs_exist_ok=True)
-    print('✅ Đã lưu dataset an toàn trên Google Drive của bạn!')
+    drive_final_dir = Path(DRIVE_OUTPUT_DIR) / 'final_dataset'
+    drive_final_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f'\\n💾 Đang đồng bộ toàn bộ dataset đóng gói và file zip về Google Drive ({drive_final_dir})...')
+    # Copy file zip vào thư mục chính của DRIVE_OUTPUT_DIR để dễ tải về
+    shutil.copy2(zip_path, Path(DRIVE_OUTPUT_DIR) / zip_path.name)
+    # Copy thư mục dataset mở rộng
+    shutil.copytree(pkg_dir, drive_final_dir, dirs_exist_ok=True)
+    
+    print('\\n=============================================================')
+    print('🎉 TẤT CẢ DỮ LIỆU ĐÃ ĐƯỢC LƯU AN TOÀN TRÊN GOOGLE DRIVE:')
+    print(f'  1. Thư mục dữ liệu xử lý: {Path(DRIVE_OUTPUT_DIR) / \"augmented_data\"}')
+    print(f'  2. Checkpoints huấn luyện: {Path(DRIVE_OUTPUT_DIR) / \"checkpoints\"}')
+    print(f'  3. File Zip Dataset nén:   {Path(DRIVE_OUTPUT_DIR) / zip_path.name}')
+    print(f'  4. Dataset giải nén:       {drive_final_dir}')
+    print('=============================================================')
 """)
 
     # Cell 10: Kaggle Upload
