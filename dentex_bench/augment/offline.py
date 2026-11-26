@@ -14,7 +14,9 @@ import json
 from pathlib import Path
 import shutil
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+import sys
 import numpy as np
+from tqdm import tqdm
 
 from dentex_bench.augment.config import AugmentConfig
 from dentex_bench.augment.bank import ToothBank
@@ -194,6 +196,18 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
 
     last_done_index = manifest.progress.get("last_done_index", -1)
 
+    # Synthetic results of images finished before an interruption, so a resumed run exports them too
+    synthetic_log = state_dir / "synthetic.jsonl"
+    saved_syn: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    if cfg.output.overwrite and synthetic_log.exists():
+        synthetic_log.unlink()
+    elif synthetic_log.is_file():
+        with open(synthetic_log, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    s_dict = json.loads(line)
+                    saved_syn[(int(s_dict["orig_image_id"]), int(s_dict["variant_idx"]))] = s_dict
+
     # 5. Build tasks for uncompleted images
     tasks_to_run = []
     task_indices = []
@@ -214,14 +228,17 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
 
     # 6. Execute tasks across workers with invariance
     workers = int(cfg.offline.get("num_workers", 1))
-    all_synthetic_results: List[Dict[str, Any]] = []
 
     def _handle_result(task_idx: int, recipes: List[Recipe], syn_results: List[Dict[str, Any]]) -> None:
         for r in recipes:
             saved_recipes_by_id[r.recipe_id] = r.to_dict()
-        all_synthetic_results.extend(syn_results)
         # Atomically write sorted recipes
         _atomic_write_recipes(recipes_file, saved_recipes_by_id.values())
+        if syn_results:
+            with open(synthetic_log, "a", encoding="utf-8") as f:
+                for syn in syn_results:
+                    f.write(json.dumps(syn) + "\n")
+                    saved_syn[(int(syn["orig_image_id"]), int(syn["variant_idx"]))] = syn
         # Atomically update progress
         counts_delta = {
             "recipes": len(recipes),
@@ -231,14 +248,22 @@ def run_offline(cfg: AugmentConfig, bank: Optional[ToothBank] = None) -> Path:
         update_progress(run_dir, last_done_index=task_idx, counts_delta=counts_delta)
 
     if tasks_to_run:
+        progress = tqdm(total=len(tasks_to_run), desc="augment images", unit="img", file=sys.stdout,
+                        mininterval=10, initial=0, dynamic_ncols=False, ncols=100)
+        if last_done_index >= 0:
+            print(f"[augment] Resuming after image {last_done_index + 1}/{len(raw_images)}", flush=True)
         if workers > 1:
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 for task_idx, (recs, syns) in zip(task_indices, executor.map(_process_image_variants, tasks_to_run)):
                     _handle_result(task_idx, recs, syns)
+                    progress.update(1)
         else:
             for task_idx, task in zip(task_indices, tasks_to_run):
                 recs, syns = _process_image_variants(task)
                 _handle_result(task_idx, recs, syns)
+                progress.update(1)
+        progress.close()
+    all_synthetic_results: List[Dict[str, Any]] = list(saved_syn.values())
 
     # 7. Dataset Export (COCO & YOLO) if save_dataset is enabled
     if cfg.output.save_dataset:

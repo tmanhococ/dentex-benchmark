@@ -2,6 +2,7 @@
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
@@ -30,6 +31,16 @@ from dentex_bench.models import (
 )
 
 
+def out_of_time(started_at: float, limit_min, epoch_seconds: list, now: float | None = None) -> bool:
+    """True when the next epoch (estimated as the slowest one so far, x1.1) would not finish within limit_min."""
+    if not limit_min:
+        return False
+    now = time.time() if now is None else now
+    remaining = float(limit_min) * 60.0 - (now - started_at)
+    needed = 1.1 * max(epoch_seconds) if epoch_seconds else 0.0
+    return remaining <= 0 or needed > remaining
+
+
 def collate_fn(batch):
     """Collate function for object detection datasets returning tuple of images and tuple of targets."""
     return tuple(zip(*batch))
@@ -55,6 +66,8 @@ def parse_args(args=None):
     parser.add_argument("--resume", action="store_true", help="Resume from last.pth if found in output directory")
     parser.add_argument("--eval-interval", type=int, default=1, help="Run validation evaluation every N epochs")
     parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers (0 avoids fork deadlock)")
+    parser.add_argument("--time-limit-min", type=float, default=None,
+                        help="Wall-clock budget in minutes; stops cleanly before an epoch that would not finish in time")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (default: 16 // batch_size)")
     return parser.parse_args(args)
 
@@ -217,9 +230,11 @@ def main(args=None):
 
     last_pth = output_dir / "last.pth"
     if getattr(args, "resume", False) and last_pth.is_file():
-        ckpt = runner.load_checkpoint(last_pth)
-        saved_info = ckpt.get("extra_info", {})
-        saved_epoch = saved_info.get("epoch", 0)
+        # load_checkpoint returns the extra_info dict saved with the checkpoint (the epoch record)
+        saved_info = runner.load_checkpoint(last_pth) or {}
+        if "extra_info" in saved_info:
+            saved_info = saved_info["extra_info"] or {}
+        saved_epoch = int(saved_info.get("epoch", 0))
         start_epoch = saved_epoch + 1
         history_path = output_dir / "history.json"
         if history_path.is_file():
@@ -228,6 +243,8 @@ def main(args=None):
                     history = json.load(f)
             except Exception:
                 pass
+        # Keep only epochs the restored weights have seen, so history never repeats an epoch
+        history = [h for h in history if int(h.get("epoch", 0)) <= saved_epoch]
         if history:
             if val_ann.exists():
                 best_score = max(h.get("val_mAP50", float("-inf")) for h in history)
@@ -241,7 +258,14 @@ def main(args=None):
         print(f"[dentex_bench] Warning: {val_ann} not found; best.pth falls back to the lowest training loss.", flush=True)
 
     eval_interval = getattr(args, "eval_interval", 1) or 1
+    started_at = time.time()
+    epoch_seconds: list = [float(h["seconds"]) for h in history if "seconds" in h]  # durations seen before a resume
     for epoch in range(start_epoch, cfg.epochs + 1):
+        if out_of_time(started_at, getattr(args, "time_limit_min", None), epoch_seconds):
+            print(f"[dentex_bench] TIME LIMIT: stopping before epoch {epoch}/{cfg.epochs} "
+                  f"(budget {args.time_limit_min:.0f} min). Resume later with --resume.", flush=True)
+            break
+        epoch_t0 = time.time()
         if hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch)
         elif hasattr(dataloader.dataset, "set_epoch"):
@@ -266,9 +290,11 @@ def main(args=None):
         else:
             score = -loss_dict["loss"]
 
+        record["seconds"] = round(time.time() - epoch_t0, 1)
+        epoch_seconds.append(record["seconds"])
         history.append(record)
         format_val = lambda v: f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
-        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {format_val(v)}" for k, v in record.items() if k not in ("epoch", "augmentation")), flush=True)
+        print(f"Epoch [{epoch}/{cfg.epochs}] - " + ", ".join(f"{k}: {format_val(v)}" for k, v in record.items() if k not in ("epoch", "augmentation", "seconds")), flush=True)
 
         # Always update last.pth and history at the current epoch, so a disconnect loses at most one epoch
         if score > best_score:
@@ -281,7 +307,8 @@ def main(args=None):
     # Save history json and curve plot
     with open(output_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
-    plot_training_history(history, output_dir / "training_curves.png")
+    if history:
+        plot_training_history(history, output_dir / "training_curves.png")
 
     print(f"=== Training Finished for {args.model}. Checkpoints saved to {output_dir} ===", flush=True)
     return 0

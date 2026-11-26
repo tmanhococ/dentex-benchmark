@@ -141,3 +141,29 @@ def test_offline_swap_pastes_the_source_tooth_not_a_placeholder(tmp_path):
     assert syn_anns and all(a["fdi"] in (16, 36) and a.get("segmentation") for a in syn_anns)
     summary = json.loads((run_dir / "state" / "qc_summary.json").read_text())
     assert summary["ops"] == 6
+
+
+def test_offline_resume_after_interruption_exports_every_synthetic_image(tmp_path):
+    raw = _make_dentex_dataset(tmp_path, n_images=6)
+    train, val = tmp_path / "processed" / "t.json", tmp_path / "processed" / "v.json"
+    convert_dentex_annotations_to_coco(raw, train, val, split_ratio=1.0)
+    overrides = [
+        f"paths.train_ann={train}", f"paths.val_ann={val}", f"paths.img_dir={tmp_path / 'xrays'}",
+        f"paths.out_root={tmp_path / 'out'}", "offline.variants_per_image=1", "output.formats=[coco]",
+    ]
+    run_dir = run_offline(load_config("configs/augment/base.yaml", cli_overrides=overrides))
+    full = json.loads((run_dir / "dataset" / "coco" / "instances_train_aug.json").read_text())
+
+    # Simulate a kernel dying after image 3: manifest says running, last done index 2
+    manifest_path = run_dir / "state" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["status"] = "running"
+    manifest["progress"]["last_done_index"] = 2
+    manifest_path.write_text(json.dumps(manifest))
+    (run_dir / "dataset" / "coco" / "instances_train_aug.json").unlink()
+
+    run_dir = run_offline(load_config("configs/augment/base.yaml", cli_overrides=overrides))
+    resumed = json.loads((run_dir / "dataset" / "coco" / "instances_train_aug.json").read_text())
+    assert resumed["images"] == full["images"]
+    assert resumed["annotations"] == full["annotations"]
+    assert json.loads((run_dir / "state" / "qc_summary.json").read_text())["synthetic_images"] == 6
