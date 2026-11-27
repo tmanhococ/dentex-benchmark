@@ -50,7 +50,13 @@ Notebook này chạy **đúng phần dữ liệu của notebook 05** (cùng mã,
 3. **Save Version → Save & Run All (Commit)**.
 4. Khi xong: mở version → tab **Output** → **New Dataset** (hoặc *Create Dataset*) để biến Output thành Kaggle Dataset.
 
-### Nội dung Output (`/kaggle/working/<RUN_TAG>/`)
+### Output
+Output chỉ có `<RUN_TAG>.zip` (toàn bộ dataset) và `<RUN_TAG>_info/` (README, dataset_info, ảnh QC để xem nhanh). Kaggle có thể tự giải nén zip khi tạo Dataset; nếu không, notebook dùng dataset chỉ cần giải nén vào `/tmp`:
+```python
+import zipfile; zipfile.ZipFile('/kaggle/input/<dataset>/dentex_v2_augmented.zip').extractall('/tmp')
+```
+
+### Nội dung bên trong zip (`<RUN_TAG>/`)
 ```
 images/train/          ảnh gốc của tập train
 images/val/            ảnh gốc của tập val (không bao giờ bị augment)
@@ -77,7 +83,7 @@ NUM_AUGMENT_PER_IMAGE = 2            # số ảnh ghép sinh ra cho mỗi ảnh 
 VAL_SPLIT = 0.2                      # giống notebook 05 để ra đúng cùng tập train/val
 SEED = 42
 QC_PAIRS = 8                         # số cặp trước/sau hiển thị ở bước QC
-MAKE_ZIP = False                     # True: nén thêm toàn bộ thành 1 file zip (gấp đôi dung lượng Output)
+ZIP_OUTPUT = True                    # True: nén cả dataset thành 1 file zip rồi xoá thư mục (Kaggle không lưu trọn hàng nghìn file)
 """)
 
     md("## 💻 Cell 1: Môi trường & thư mục output")
@@ -186,12 +192,53 @@ Layout: `images/{{train,val,synthetic}}/`, `annotations/instances_{{train,train_
 '''
 (OUT / 'README.md').write_text(readme, encoding='utf-8')
 
-if MAKE_ZIP:
-    shutil.make_archive(str(Path(OUTPUT_ROOT) / RUN_TAG), 'zip', root_dir=OUT.parent, base_dir=OUT.name)
-
 n_files = sum(1 for p in OUT.rglob('*') if p.is_file())
 print(json.dumps(info, indent=2, ensure_ascii=False))
 print(f'\n📦 {OUT}: {n_files} file, {dir_size_mb(OUT) / 1024:.2f} GB')
+""")
+
+    md(r"""## 🗜️ Cell 10: Nén thành 1 file zip
+
+Kaggle không lưu trọn Output có hàng nghìn file trong nhiều thư mục con (lần chạy trước: 10136 file, 5.55 GB nhưng Output chỉ còn 50 file, 117 MB). Vì vậy dataset được nén thành **một file** `<RUN_TAG>.zip` rồi xoá thư mục gốc. Ảnh PNG đã nén sẵn nên zip dùng chế độ *store* (không nén lại): nhanh và dung lượng gần như không đổi.
+
+Một vài file nhỏ (`README.md`, `dataset_info.json`, ảnh QC) được để ngoài zip trong `<RUN_TAG>_info/` để xem nhanh trên Kaggle.""")
+    code(r"""import zipfile
+
+ZIP_PATH = Path(OUTPUT_ROOT) / f'{RUN_TAG}.zip'
+INFO_DIR = Path(OUTPUT_ROOT) / f'{RUN_TAG}_info'
+if not ZIP_OUTPUT:
+    print('ZIP_OUTPUT = False: giữ nguyên thư mục, không nén.')
+else:
+    free_gb = shutil.disk_usage(OUTPUT_ROOT).free / 1024**3
+    need_gb = dir_size_mb(OUT) / 1024
+    print(f'Cần {need_gb:.2f} GB để nén, còn trống {free_gb:.2f} GB')
+    if free_gb < need_gb * 1.05:
+        raise OSError('Không đủ chỗ trống để tạo file zip')
+
+    files = sorted(p for p in OUT.rglob('*') if p.is_file())
+    ZIP_PATH.unlink(missing_ok=True)
+    with zipfile.ZipFile(ZIP_PATH, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for p in tqdm(files, desc='nén zip', file=sys.stdout, mininterval=10, ncols=100):
+            zf.write(p, arcname=str(Path(RUN_TAG) / p.relative_to(OUT)))
+
+    # Kiểm tra zip trước khi xoá thư mục gốc
+    with zipfile.ZipFile(ZIP_PATH) as zf:
+        names = [n for n in zf.namelist() if not n.endswith('/')]
+    if len(names) != len(files):
+        raise RuntimeError(f'Zip có {len(names)} file, thư mục có {len(files)} file')
+
+    if INFO_DIR.exists():
+        shutil.rmtree(INFO_DIR)
+    INFO_DIR.mkdir(parents=True)
+    for f in ['README.md', 'dataset_info.json', 'bank_report.json', 'code_commit.txt',
+              'qc_before_after.png', 'labels_check.png']:
+        if (OUT / f).is_file():
+            shutil.copy2(OUT / f, INFO_DIR / f)
+    shutil.rmtree(OUT)
+    print(f'✅ {ZIP_PATH.name}: {len(names)} file, {ZIP_PATH.stat().st_size / 1024**3:.2f} GB')
+
+left = [p for p in Path(OUTPUT_ROOT).rglob('*') if p.is_file()]
+print(f'Output còn {len(left)} file:', sorted(str(p.relative_to(OUTPUT_ROOT)) for p in left)[:12])
 print(f'Tổng thời gian: {(time.time() - NB_START) / 60:.1f} phút. Xong: vào tab Output → New Dataset.')
 """)
 

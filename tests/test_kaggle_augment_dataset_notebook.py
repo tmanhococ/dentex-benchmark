@@ -51,8 +51,17 @@ def test_headless_export_writes_complete_dataset(tmp_path):
     cfg_cell.source = "\n".join(next((overrides[k] for k in overrides if l.startswith(k)), l) for l in cfg_cell.source.splitlines())
     ExecutePreprocessor(timeout=1200, kernel_name="python3").preprocess(nb, {"metadata": {"path": str(repo)}})
 
-    out = work / "dentex_v2_augmented"
-    ann = {n: json.loads((out / "annotations" / f"instances_{n}.json").read_text()) for n in ["train", "train_aug", "val"]}
+    # Output must be just the zip plus a small info folder, never thousands of loose files
+    assert not (work / "dentex_v2_augmented").exists()
+    top = sorted(p.name for p in work.iterdir())
+    assert top == ["dentex_v2_augmented.zip", "dentex_v2_augmented_info"], top
+    for f in ["README.md", "dataset_info.json", "qc_before_after.png"]:
+        assert (work / "dentex_v2_augmented_info" / f).is_file(), f
+
+    import zipfile
+    zipfile.ZipFile(work / "dentex_v2_augmented.zip").extractall(tmp_path / "unzipped")
+    out = tmp_path / "unzipped" / "dentex_v2_augmented"
+    ann ={n: json.loads((out / "annotations" / f"instances_{n}.json").read_text()) for n in ["train", "train_aug", "val"]}
     on_disk = {p.name for p in (out / "images").rglob("*.png")}
     for c in ann.values():
         assert {im["file_name"] for im in c["images"]} <= on_disk
