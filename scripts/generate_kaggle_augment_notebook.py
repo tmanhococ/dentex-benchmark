@@ -11,7 +11,8 @@ import json
 from pathlib import Path
 
 
-def create_notebook():
+def build_cells():
+    """Cells of notebook 05; notebook 06 reuses the data/bank/augment/QC cells verbatim."""
     cells = []
 
     def md(text):
@@ -527,6 +528,11 @@ print(f'Tổng thời gian notebook: {(time.time() - NB_START) / 3600:.2f} giờ
 print(json.dumps(json.loads(status_file.read_text(encoding='utf-8')) if status_file.exists() else {}, indent=2, ensure_ascii=False))
 """)
 
+    return cells
+
+
+def create_notebook():
+    cells = build_cells()
     nb = {
         "cells": cells,
         "metadata": {
